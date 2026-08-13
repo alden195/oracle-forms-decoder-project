@@ -1,0 +1,72 @@
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### IntelliJ IDEA ###
+.idea/modules.xml
+.idea/jarRepositories.xml
+.idea/compiler.xml
+.idea/libraries/
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### Mac OS ###
+.DS_Store
+
+###############################################################################
+# Session secrets — never commit these
+#
+# Two of the extension's own features write secrets to disk, both under these
+# default filenames:
+#
+#   * "Export…"                     -> the 5-byte RC4 key for every session
+#   * "Export validation fixtures…" -> the GDay/Mate handshake randoms, which
+#                                      are exactly what the keys are derived from
+#
+# Either file is enough to decrypt the traffic it came from, so they are treated
+# the same as any other credential material.
+###############################################################################
+oracle-forms-keys.json
+oracle-forms-fixtures.json
+src/test/resources/fixtures/
+
+### Claude Code (machine-local settings) ###
+.claude/settings.local.json
+
+### IntelliJ ###
+# Ignored wholesale rather than file-by-file: misc.xml pins a specific JDK name
+# and language level that will not match another machine, and none of it is
+# needed to build (Gradle is the source of truth).
+.idea/
+
+### Local tool configuration (contains absolute paths for this machine) ###
+.mcp.json
+.ai/
