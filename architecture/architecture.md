@@ -65,11 +65,17 @@ Oracle Forms HTTP Transport (FHT), Forms 10g/11g:
 
 ### Confirmed against a live capture
 
-> **Note on identifiers.** Every hostname, `JSESSIONID`, server instance name and WebLogic route id
-> in this document and in the test suite has been **replaced with a synthetic value of the same
-> shape** before publication. The observations and the structural properties they demonstrate are
-> real; the literal bytes are not, and cannot be correlated with any live system. Replacement is
-> consistent throughout, so a value that appears in two places is still the same value.
+> **Note on identifiers.** Every hostname, `JSESSIONID`, `JSESSIONID_FORMS` value — including its
+> rotating suffix — server instance name and WebLogic route id in this document and in the test suite
+> has been **replaced with a synthetic value of the same shape** before publication. The observations
+> and the structural properties they demonstrate are real; the literal bytes are not, and cannot be
+> correlated with any live system. Replacement is consistent throughout, so a value that appears in
+> two places is still the same value.
+>
+> The rotating suffix was **added to this list on 2026-08-14**, having been missed by the original
+> pass: the values after the `|` were real. A synthetic suffix now reads `rot01`, `rot02`, and so on,
+> which is deliberately impossible to mistake for a captured one. If you add a fixture, invent the
+> suffix too — the rule is that no literal byte in this repository came off a real wire.
 
 Read from the Burp proxy history of the current project on 2026-08-13 (target
 `forms.example.edu/forms/lservlet`, Forms 11g, ~1,100 encrypted pragma POSTs across 22
@@ -268,7 +274,7 @@ The capture shows **two** session cookies, and picking the wrong one silently de
 | `JSESSIONID_FORMS` | Rotates mid-session via `Set-Cookie`, often every few messages | **No** |
 
 Observed directly: one session held `JSESSIONID=X43xQtj1…` while `JSESSIONID_FORMS` moved from
-`formsapp_rs1|anQtg` at Pragma 1 to `formsapp_rs1|anQ0T` by Pragma 65. Keying on `JSESSIONID_FORMS`
+`formsapp_rs1|rot01` at Pragma 1 to `formsapp_rs1|rot02` by Pragma 65. Keying on `JSESSIONID_FORMS`
 would shatter a single RC4 stream into dozens of fragments, each missing the Pragma 1 that carries
 its key — the failure would look like "no key for this session" on almost every message.
 

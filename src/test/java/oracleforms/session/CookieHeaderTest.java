@@ -17,12 +17,12 @@ import org.junit.jupiter.api.Test;
 class CookieHeaderTest {
 
     private static final String HEADER =
-            "JSESSIONID_FORMS=formsapp_rs1|anQtg; JSESSIONID=X43xQtj1!-1111111111; extra=keepme";
+            "JSESSIONID_FORMS=formsapp_rs1|rot01; JSESSIONID=X43xQtj1!-1111111111; extra=keepme";
 
     @Test
     @DisplayName("reads a named cookie, matching exactly rather than by prefix")
     void readsByExactName() {
-        assertEquals(Optional.of("formsapp_rs1|anQtg"),
+        assertEquals(Optional.of("formsapp_rs1|rot01"),
                 CookieHeader.value(HEADER, SessionId.ROTATING_COOKIE_NAME));
         assertEquals(Optional.of("X43xQtj1!-1111111111"),
                 CookieHeader.value(HEADER, SessionId.COOKIE_NAME),
@@ -35,9 +35,9 @@ class CookieHeaderTest {
     @DisplayName("replaces one cookie and preserves every other, in order")
     void replacesOnlyTheNamedCookie() {
         String updated = CookieHeader.withValue(
-                HEADER, SessionId.ROTATING_COOKIE_NAME, "formsapp_rs1|anQ0T");
+                HEADER, SessionId.ROTATING_COOKIE_NAME, "formsapp_rs1|rot02");
 
-        assertEquals(Optional.of("formsapp_rs1|anQ0T"),
+        assertEquals(Optional.of("formsapp_rs1|rot02"),
                 CookieHeader.value(updated, SessionId.ROTATING_COOKIE_NAME));
         assertEquals(Optional.of("X43xQtj1!-1111111111"),
                 CookieHeader.value(updated, SessionId.COOKIE_NAME));

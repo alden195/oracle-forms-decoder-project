@@ -17,7 +17,7 @@ class SessionIdTest {
 
     /** A real header from the capture, both cookies present. */
     private static final String REAL_COOKIE =
-            "JSESSIONID_FORMS=formsapp_rs1|anAnK; "
+            "JSESSIONID_FORMS=formsapp_rs1|rot03; "
                     + "JSESSIONID=HpCezl7mJxic18WHFatPXkZWfk25nsZm_xpO4rBsATmEgvguJ77e!-1111111111";
 
     @Test
@@ -35,21 +35,21 @@ class SessionIdTest {
     @Test
     @DisplayName("never matches JSESSIONID_FORMS, in either cookie order")
     void neverMatchesTheRotatingCookie() {
-        String formsFirst = "JSESSIONID_FORMS=formsapp_rs1|anQtg; JSESSIONID=stable-value";
-        String formsSecond = "JSESSIONID=stable-value; JSESSIONID_FORMS=formsapp_rs1|anQ0T";
+        String formsFirst = "JSESSIONID_FORMS=formsapp_rs1|rot01; JSESSIONID=stable-value";
+        String formsSecond = "JSESSIONID=stable-value; JSESSIONID_FORMS=formsapp_rs1|rot02";
 
         assertEquals(Optional.of("stable-value"), SessionId.fromCookieHeader(formsFirst));
         assertEquals(Optional.of("stable-value"), SessionId.fromCookieHeader(formsSecond));
 
         // With only the rotating cookie present, the answer must be "no id", not its value.
-        assertTrue(SessionId.fromCookieHeader("JSESSIONID_FORMS=formsapp_rs1|anQtg").isEmpty());
+        assertTrue(SessionId.fromCookieHeader("JSESSIONID_FORMS=formsapp_rs1|rot01").isEmpty());
     }
 
     @Test
     @DisplayName("the rotating cookie's value does not leak through as the session id")
     void rotatingValueNeverReturned() {
-        String a = "JSESSIONID_FORMS=formsapp_rs1|anQtg; JSESSIONID=constant";
-        String b = "JSESSIONID_FORMS=formsapp_rs1|anQ0T; JSESSIONID=constant";
+        String a = "JSESSIONID_FORMS=formsapp_rs1|rot01; JSESSIONID=constant";
+        String b = "JSESSIONID_FORMS=formsapp_rs1|rot02; JSESSIONID=constant";
 
         // Same session, rotated forms cookie: the extracted id must not move.
         assertEquals(SessionId.fromCookieHeader(a), SessionId.fromCookieHeader(b));
@@ -69,7 +69,7 @@ class SessionIdTest {
     void readsSetCookie() {
         assertEquals(Optional.of("abc123!-1111111111"),
                 SessionId.fromSetCookieHeader("JSESSIONID=abc123!-1111111111; path=/; HttpOnly"));
-        assertTrue(SessionId.fromSetCookieHeader("JSESSIONID_FORMS=formsapp_rs1|anAnD; path=/")
+        assertTrue(SessionId.fromSetCookieHeader("JSESSIONID_FORMS=formsapp_rs1|rot05; path=/")
                 .isEmpty());
     }
 
@@ -92,12 +92,12 @@ class SessionIdTest {
     @DisplayName("Pragma 0 is attributed to the session its response establishes, not the stale one")
     void pragmaZeroPrefersTheAssignedId() {
         String staleRequestCookie =
-                "JSESSIONID_FORMS=formsapp_rs1|anAis; "
+                "JSESSIONID_FORMS=formsapp_rs1|rot04; "
                         + "JSESSIONID=A5bnVY0lbICChzGJFT9uYK9-kbVd3uieh_B5Jyic8ZlFHg6uk8wc!-1111111111";
         List<String> setCookies = List.of(
                 "JSESSIONID=HpCezl7mJxic18WHFatPXkZWfk25nsZm_xpO4rBsATmEgvguJ77e!-1111111111;"
                         + " path=/; HttpOnly;HttpOnly",
-                "JSESSIONID_FORMS=formsapp_rs1|anAnK; path=/");
+                "JSESSIONID_FORMS=formsapp_rs1|rot03; path=/");
 
         assertEquals(
                 Optional.of("HpCezl7mJxic18WHFatPXkZWfk25nsZm_xpO4rBsATmEgvguJ77e!-1111111111"),
@@ -109,7 +109,7 @@ class SessionIdTest {
     @DisplayName("Set-Cookie order does not matter, and JSESSIONID_FORMS is never picked")
     void pragmaZeroIgnoresTheRotatingSetCookie() {
         List<String> formsFirst = List.of(
-                "JSESSIONID_FORMS=formsapp_rs1|anAnK; path=/",
+                "JSESSIONID_FORMS=formsapp_rs1|rot03; path=/",
                 "JSESSIONID=the-real-one; path=/; HttpOnly");
 
         assertEquals(Optional.of("the-real-one"),
@@ -118,7 +118,7 @@ class SessionIdTest {
         // Only the rotating cookie assigned: fall back to the request cookie rather than take it.
         assertEquals(Optional.of("from-request"),
                 SessionId.resolveForPragma(0, "JSESSIONID=from-request", null,
-                        List.of("JSESSIONID_FORMS=formsapp_rs1|anAnK; path=/")));
+                        List.of("JSESSIONID_FORMS=formsapp_rs1|rot03; path=/")));
     }
 
     /**
@@ -145,12 +145,12 @@ class SessionIdTest {
     @DisplayName("the servlet-info GET establishes the session whatever pragma it carries")
     void getInfoEstablishesTheSessionAtAnyPragma() {
         String staleRequestCookie =
-                "JSESSIONID_FORMS=formsapp_rs2|an1s+; "
+                "JSESSIONID_FORMS=formsapp_rs2|rot07+; "
                         + "JSESSIONID=Fd5x3qn7VQcgK5jjzzCI3p8iI0piuMb0KT6NXr2VwXaZd5r8_PhT!-2222222222";
         List<String> setCookies = List.of(
                 "JSESSIONID=xJ5grzn3xNpznVZFgfND4t1N5TWrV9s5gUNiDHUVcsVMsbNLnw_j!-2222222222;"
                         + " path=/; HttpOnly;HttpOnly;Secure",
-                "JSESSIONID_FORMS=formsapp_rs2|an1tD; path=/");
+                "JSESSIONID_FORMS=formsapp_rs2|rot06; path=/");
         String getInfoUrl =
                 "https://h/forms/lservlet?ifcmd=getinfo&iflocale=en-US&ifhost=ubuntu&ifip=127.0.1.1";
 

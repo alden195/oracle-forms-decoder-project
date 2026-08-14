@@ -19,6 +19,38 @@ What changed, in a sentence or two.
 
 ---
 
+## 2026-08-14 — Redacted the rotating cookie suffix, missed by the first pass
+
+The 2026-08-13 redaction replaced every hostname, `JSESSIONID`, server instance name and WebLogic
+route id. It did not replace the **suffix of `JSESSIONID_FORMS`** — the part after the `|` — because
+that was never on the list. So while the server instance name became `formsapp_rs1`, the values
+beside it were real: seven distinct suffixes across `SessionIdTest`, `CookieHeaderTest`,
+`architecture.md` and one historical entry in this file. Two of them were confirmed real by comparing against live proxy
+history while testing the send path.
+
+All seven are now synthetic, and named so they cannot be mistaken for captured data: `rot01`,
+`rot02`, and so on, with `rot07+` keeping the odd character a real value carried. Shape and the
+rotation each test demonstrates are preserved, so nothing the suite proves has changed — 185 tests,
+unchanged.
+
+The list in §1's note on identifiers now names the rotating suffix explicitly, with the rule stated
+plainly: no literal byte in this repository came off a real wire. The original list was an
+enumeration of what had been noticed, and anything not enumerated was silently out of scope, which is
+how these survived.
+
+**Severity, honestly:** low. These are five-character WebLogic routing tokens from sessions that
+expired months ago, sitting beside a server instance name that was already fake. They unlock nothing
+and identify nobody on their own. The reason to fix them is that "we redact captured identifiers" is
+either a rule or it is not.
+
+**This does not remove them from history.** They are in `411af92`, which is published on a public
+remote, so the fix cleans the tip and nothing before it. Removing them from history means rewriting
+it and force-pushing over a published branch — a separate decision, not something to fold into a
+routine change.
+
+**Affects:** `session/SessionIdTest.java`, `session/CookieHeaderTest.java`,
+`architecture/architecture.md`, `changes/changes.md`.
+
 ## 2026-08-14 — Two fail-safe holes found by review
 
 A multi-agent review of the send path raised three findings. One was a false positive; the other two
@@ -584,7 +616,7 @@ confirmed, and §8 is split into "resolved" and "still open".
 Substantive changes rather than just annotations:
 
 - **Session id is `JSESSIONID`, not `JSESSIONID_FORMS`.** Both cookies are present; the latter
-  rotates mid-session (observed moving `anQtg` → `anQ0T` within one session). The docs previously
+  rotates mid-session (observed moving `rot01` → `rot02` within one session). The docs previously
   said only "check the URL and the Cookie header", which would not have stopped anyone from keying on
   the wrong cookie and fragmenting every RC4 stream. Now a table in §3.
 - **A key-derivation self-test that needs no plaintext.** The first four ciphertext bytes of the
