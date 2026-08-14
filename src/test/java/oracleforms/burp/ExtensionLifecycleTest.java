@@ -110,6 +110,8 @@ class ExtensionLifecycleTest {
         assertTrue(recorder.called("registerHttpHandler"), "key capture must be registered");
         assertTrue(recorder.called("registerHttpRequestEditorProvider"));
         assertTrue(recorder.called("registerHttpResponseEditorProvider"));
+        assertTrue(recorder.called("registerContextMenuItemsProvider"),
+                "\"Send decoded to Repeater\" is the only way into the editing feature");
         assertTrue(recorder.called("registerSuiteTab"), "the Sessions tab must be registered");
         assertTrue(recorder.called("registerUnloadingHandler"),
                 "without this the extension cannot clean up (BApp criterion 6)");

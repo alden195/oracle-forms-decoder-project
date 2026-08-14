@@ -93,7 +93,7 @@ No runtime dependencies — the Montoya API is `compileOnly` and provided by Bur
 The extension JAR is written to `build/libs/`.
 
 ```bash
-./gradlew test     # 104 unit and integration tests
+./gradlew test     # 185 unit and integration tests
 ./gradlew build    # compile + test
 ```
 
@@ -157,9 +157,14 @@ src/main/java/oracleforms/
 on-demand decoding in both directions, gap reporting, reassembly of responses split across messages,
 sensitive-value highlighting, and session management with import/export.
 
-**Not yet built:** message editing. Re-encoding requires a writer that reproduces captured messages
-byte for byte, because any length change shifts the keystream position for every later message in the
-session; shipping it before that is verified would corrupt sessions.
+**Also working:** editing and sending. A captured message can be sent to Repeater as decoded
+plaintext, edited property by property, and re-encrypted at the live session's keystream position on
+Send — the client's own session keeps working afterwards, because Burp holds separate ciphers toward
+the client and toward the server. See [`architecture/architecture.md`](architecture/architecture.md)
+§6 for how that works and what it does to the session you send into.
+
+**Not yet built:** bootstrapping a fresh session to make a send repeatable (§6.4 mode B), editing
+responses in flight, and the auto-modification rules tab.
 
 **Known limitation:** the key derivation formula is not yet validated against real captured bytes.
 The existing tests build their sessions with the same formula they check, so they demonstrate

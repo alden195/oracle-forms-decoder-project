@@ -6,9 +6,15 @@ Feature list for the Oracle Forms traffic decoder. Design detail lives in
 See `features/improvements.md` for a survey of the extension as built and a prioritised backlog of
 what should change next — including the test-coverage gap that has now let two bugs through.
 
-> **Status: build order steps 1–5 done** (2026-08-13). The extension builds, loads, decodes
-> read-only in both directions, and persists keys. Editing (step 6) and the rules tab (step 7)
-> remain. Numbers in brackets map to the build order in architecture §9.
+> **Status: build order steps 1–5 done** (2026-08-13), **6a–6e done** (2026-08-14). Numbers in
+> brackets map to the build order in architecture §9; step 6's letters map to the sub-build-order in
+> architecture §6.8.
+>
+> **Step 6a–6e built** (2026-08-14). Sending a modified message from Repeater works: draft a
+> captured message into Repeater as plaintext, edit it property by property, and it is re-encrypted
+> at the live session's keystream position on Send — with the real client's session surviving. 185
+> tests. Mode B (6f) and response editing (6g) remain; nothing has yet been run against a live
+> target.
 
 Status key: `planned` · `in progress` · `done` · `blocked`
 
@@ -49,18 +55,54 @@ key alone is not enough, because the RC4 stream is continuous. See architecture 
 | Export / import key store | done | JSON, for moving between projects [4] |
 | Forget session / clear all keys | done | Keys are session secrets in an unencrypted project file [4] |
 
-## Editing
+## Editing and Repeater
 
-Deferred until `FhtWriter` round-trips captured samples byte for byte — re-encoding is not
-trustworthy before that.
+**The goal: send a captured message to Repeater, change a value, press Send, and have the server
+accept it.** Designed in architecture §6 and built as 6a–6e. Sub-steps below are lettered to match
+the sub-build-order in architecture §6.8, and each was gated on the one before it.
+
+The gate on all of it was `FhtWriter` reproducing captured bytes exactly. Re-encoding before that is
+verified produces a message that is cryptographically perfect and structurally wrong, which the
+server will decrypt cleanly and then misparse — the worst failure mode available. What ships checks
+that per property, at runtime, before every edit.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| FHT re-encoder | planned | [6] |
-| Round-trip verification tests | planned | decode→encode must reproduce the original bytes [6] |
-| Editable request tab | planned | [6] |
-| Four-stream model for length-changing edits | planned | Separate client-facing and server-facing streams; fixes the reference's documented limitation [6] |
-| Auto-modification rules tab | planned | `PROPERTY = value`, applied in transit without interception [7] |
+| FHT re-encoder | done | `FhtWriter`, **splicing** rather than re-serializing: the parser is lossy, so only the edited property's byte range is rewritten and everything else is untouched by construction [6a] |
+| Round-trip verification tests | done | Re-encoding a property with its *unchanged* value must reproduce the original bytes. Enforced at runtime before every edit, not only in tests — an encoding we get subtly wrong becomes a refused edit with a reason, never a corrupted session [6a] |
+| Four-stream ledger | done | Separate client-facing and server-facing ciphers per direction, so a length change or an injected message leaves both sides internally consistent. Persisted as four byte counters plus a sequence number, so it survives a reload [6b] |
+| Marker-header contract | done | The Repeater tab carries FHT *plaintext* plus `X-OracleForms-*` headers; the HTTP handler encrypts at send time, when the correct offset is finally known, and strips the markers. Fails closed: a refused draft gets a spoofed explanatory response and never leaves Burp [6c] |
+| Send decoded message to Repeater | done | Context menu on proxy history and message editors, one item per send mode [6c] |
+| Editable request tab | done | A property table with per-row editability and the *reason* when a property is locked. Editable only where Burp's `EditorMode` is not `READ_ONLY`, so proxy history stays read-only for free [6d] |
+| Send mode A — append to session tail | done | Encrypts at the live session's current position, rewrites `Pragma` and refreshes the rotating `JSESSIONID_FORMS` without discarding the rest of the user's Cookie header. Sends per session are serialised; a gap in history means refuse, never guess [6e] |
+| Reply decryption for sent messages | done | A Repeater reply never enters proxy history, so replay cannot reach it. The interceptor decrypts it against the ledger and caches the plaintext by ciphertext hash for the response editor [6e] |
+| Send mode C — fixed offset | done | Encrypts at the captured position, touching no ledger. Verified the strongest way available: an unedited draft re-encrypts to the captured ciphertext byte for byte [6c] |
+| Send mode B — bootstrap a fresh session | planned | The extension performs its own `getinfo` GET and `GDay`/`Mate` handshake, optionally replays a captured prefix under the new key, then sends. The repeatable mode, and the only one safe to run concurrently. Gated on architecture §6.7 question 1 [6f] |
+| Editable response tab | planned | Last, because response fragment groups only bite here — a length change moves the boundaries the server chose [6g] |
+| Auto-modification rules tab | planned | `PROPERTY = value`, applied in transit without interception. Needs the same writer and outbound encoder as the rest of step 6 [7] |
+
+### What the extension cannot guarantee
+
+Three layers have to hold for a send to be accepted (architecture §6.1): cryptographic, transport, and
+application. The extension owns the first two completely. The third — whether the Forms runtime still
+has the handler ids and UI objects the message refers to — is inherent to replaying against a stateful
+application, and mode B's prefix replay only mitigates it. Five open questions and the experiments
+that settle them are listed in architecture §6.7.
+
+**The cryptographic layer is verified twice over; the application layer not at all.** In simulation,
+`RepeaterInjectionEndToEndTest` runs decode → edit → inject → server reads it → client carries on.
+Against a running Burp (2026-08-14), the deployed extension was driven at a local listener and its
+ciphertext checked against an independent RC4 implementation — key derivation, offset and tail
+encryption, keystream continuity across sends, `Pragma` rewriting, `NULLPOST` pass-through,
+fail-closed refusal and the marker trust rule all hold.
+
+**Nothing has been sent to a real Forms server.** Whether the runtime *accepts* an appended message
+is the application layer, and no amount of the above reaches it.
+
+**Intruder is supported only in mode A, and only single-threaded.** Each payload advances the shared
+server-side keystream, so parallel requests interleave into one stream and destroy each other. Sends
+are serialised per session, which makes concurrency slow rather than wrong — but the concurrency
+buys nothing, and mode B is the mode that would.
 
 ## Usability
 
@@ -82,7 +124,7 @@ list, which is a large part of why we are restructuring rather than porting it d
 | Clean unload | done | `ExtensionUnloadingHandler` shuts down the executor, clears caches (criterion 6) |
 | Bounded caches, no retained Burp objects | done | All LRU; filtered `proxy().history()` calls (criterion 9) |
 | Errors surfaced, not swallowed | done | Log to the extension error stream |
-| Unit tests over `codec/` and `session/` | done | 73 tests, including a synthetic-session replay suite and an end-to-end handshake→properties test. Possible because neither package imports Montoya (criterion 12). Still to do: re-run against byte-exact fixtures exported from the 22 captured sessions |
+| Unit tests over `codec/` and `session/` | done | 185 tests, including a synthetic-session replay suite, the four-stream ledger simulated against independent client and server parties, and an end-to-end decode→edit→inject→server-reads-it chain. Possible because neither package imports Montoya (criterion 12). Still to do: re-run against byte-exact fixtures exported from the 22 captured sessions |
 | Decoder hardened against malformed input | done | Bounded reads; bodies are untrusted (criterion 3) |
 | GUI elements parented to the Burp frame | done | Criterion 10 |
 

@@ -36,12 +36,15 @@ public final class PragmaHistorySource implements PragmaSource {
     private final String sessionId;
     private final Map<Direction, Map<Integer, byte[]>> index;
     private final int highestPragma;
+    private final String latestCookieHeader;
 
     private PragmaHistorySource(
-            String sessionId, Map<Direction, Map<Integer, byte[]>> index, int highestPragma) {
+            String sessionId, Map<Direction, Map<Integer, byte[]>> index, int highestPragma,
+            String latestCookieHeader) {
         this.sessionId = sessionId;
         this.index = index;
         this.highestPragma = highestPragma;
+        this.latestCookieHeader = latestCookieHeader;
     }
 
     /**
@@ -54,6 +57,11 @@ public final class PragmaHistorySource implements PragmaSource {
         index.put(Direction.REQUEST, new LinkedHashMap<>());
         index.put(Direction.RESPONSE, new LinkedHashMap<>());
         int highest = 0;
+
+        // The Cookie header of the latest message, so an injected one can carry the rotating
+        // JSESSIONID_FORMS the client is actually using rather than whatever a captured draft had.
+        String latestCookie = null;
+        int latestCookiePragma = -1;
 
         for (ProxyHttpRequestResponse item : api.proxy().history(
                 candidate -> matchesSession(candidate, sessionId))) {
@@ -76,6 +84,14 @@ public final class PragmaHistorySource implements PragmaSource {
             int pragma = target.get().pragma();
             highest = Math.max(highest, pragma);
 
+            if (pragma > latestCookiePragma) {
+                String cookie = cookieHeaderOf(item.finalRequest());
+                if (cookie != null) {
+                    latestCookie = cookie;
+                    latestCookiePragma = pragma;
+                }
+            }
+
             index.get(Direction.REQUEST)
                     .putIfAbsent(pragma, item.finalRequest().body().getBytes());
 
@@ -84,7 +100,7 @@ public final class PragmaHistorySource implements PragmaSource {
                         .putIfAbsent(pragma, item.response().body().getBytes());
             }
         }
-        return new PragmaHistorySource(sessionId, index, highest);
+        return new PragmaHistorySource(sessionId, index, highest, latestCookie);
     }
 
     /**
@@ -127,6 +143,25 @@ public final class PragmaHistorySource implements PragmaSource {
     /** The highest pragma number seen for this session. */
     public int highestPragma() {
         return highestPragma;
+    }
+
+    /**
+     * The {@code Cookie} header from the highest-numbered captured message of this session.
+     *
+     * <p>Used to refresh {@code JSESSIONID_FORMS} on an injected message. That cookie rotates every
+     * few messages, and a stale value can be routed to a backend that has never heard of the session
+     * — a failure that looks like bad decryption and is not.
+     */
+    public Optional<String> latestCookieHeader() {
+        return Optional.ofNullable(latestCookieHeader);
+    }
+
+    private static String cookieHeaderOf(burp.api.montoya.http.message.requests.HttpRequest request) {
+        try {
+            return request.hasHeader("Cookie") ? request.headerValue("Cookie") : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** Total bytes indexed, so the caller can reason about what it is holding. */

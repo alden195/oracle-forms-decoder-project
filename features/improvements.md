@@ -10,7 +10,7 @@ is done; this file tracks what is *worth doing* and why. Design detail belongs i
 
 ## Part 1 — What the extension does today
 
-Build order steps 1–5 are complete (architecture §9). 104 tests pass.
+Build order steps 1–5 are complete (architecture §9), and 6a–6e as of 2026-08-14. 185 tests pass.
 
 ### Core decode pipeline
 
@@ -89,10 +89,10 @@ what makes them directly unit-testable.
 ### Tier 1 — highest value
 
 **1. Test the `burp/` package.**
-Of 104 tests, nearly all live in `codec/` and `session/`. `FhtRenderer`, `PragmaHistorySource`,
-`RetroactiveKeyScanner` and `DecodeService` have essentially none — and two bugs in two days have
-landed in exactly that gap, most recently the retroactive-scan regression logged in
-`changes/changes.md`. The reflective-proxy harness in `ExtensionLifecycleTest` already proves no
+Of 185 tests, nearly all live in `codec/` and `session/`. `FhtRenderer`, `PragmaHistorySource`,
+`RetroactiveKeyScanner` and `DecodeService` have essentially none — and **four** bugs have now landed
+in exactly that gap, most recently the refusal-response `Content-Length` bug, which no simulation
+could have caught because constructing a Montoya `HttpResponse` needs a running Burp. The reflective-proxy harness in `ExtensionLifecycleTest` already proves no
 mocking library is needed; extending it into a fake proxy history makes all four testable. This
 protects every other item on this list, so it comes first.
 
@@ -112,14 +112,22 @@ Only one message can be viewed at a time, through editor tabs. Understanding an 
 interleaved. It is also the natural place to present reassembled fragment groups, which currently
 render identically across all four pragmas of a group.
 
-**4. Context menu integration.**
-`registerContextMenuItemsProvider` is not used at all. "Decode this message", "Copy decoded text",
-"Scan history for this session's key", "Export this session's fixtures" are all cheap to add, and
-context menus are the main discoverability path in Burp.
+**4. Context menu integration.** *(Partly done 2026-08-14.)*
+`registerContextMenuItemsProvider` now carries the two "Send decoded to Repeater" items. "Copy
+decoded text", "Scan history for this session's key" and "Export this session's fixtures" are still
+cheap to add, and context menus are the main discoverability path in Burp.
 
-**5. Editing — build order step 6.**
-`FhtWriter`, round-trip tests, then the four-stream model. This is what turns a viewer into a testing
-tool. **The step 6 plan needs revising before it is built** — see the note at the end of this file.
+**5. ~~Editing and Repeater — build order step 6.~~ Built, 6a–6e** (2026-08-14).
+`FhtWriter`, the identity gate, the four-stream ledger, the marker contract, the editable property
+table, and mode A tail append all ship. Item 4 above went with it: the context menu now exists,
+though only with the two "Send decoded to Repeater" items.
+
+**What remains of step 6:** mode B session bootstrap (6f), gated on architecture §6.7 question 1, and
+response editing (6g). See `changes/changes.md` for the five ways the build differed from the design.
+
+**The most valuable next step is not more code.** Everything in §6 is verified by simulation only —
+the five experiments in architecture §6.7 need a live target, and question 1 decides whether mode B
+is cheap or expensive to build.
 
 ### Tier 2 — correctness
 
@@ -192,14 +200,27 @@ reaching for the weaker one; either fold it in or mark it clearly as the keyless
 
 ## A note on build order step 6
 
+> **Resolved 2026-08-14.** Architecture §6 has been rewritten and now answers both points. Kept here
+> because it is the record of what forced the rewrite, and because the second point turned out to
+> constrain the build order rather than the design.
+
 The `NULLPOST` and fragmentation findings add requirements the four-stream design in architecture §6
 did not anticipate, and they should be worked through before any of it is built:
 
 - **Re-encryption must skip `NULLPOST`s entirely.** They never entered the cipher, so a forwarding
   stream that encrypts them desynchronises the server exactly the way decoding did before the fix.
+
+  *Answered:* §6.5, handler rule 4 — a plaintext body of exactly those eight bytes is sent cleartext
+  and advances nothing, mirroring the decode rule.
+
 - **A length-changing edit inside a fragment group moves the group's boundaries.** The server splits
   its output at buffer-sized offsets that have nothing to do with message boundaries, so editing a
   reassembled message means deciding how the result is re-split — and the client pulls continuations
   with `NULLPOST`s whose count may then change.
+
+  *Answered:* this is a **response**-side problem only. Requests are small and are never fragmented,
+  so it does not touch the Repeater feature at all — it is confined to step 6g, editing responses in
+  flight to the client, which is deliberately last. The concern is real but it holds up much less
+  than it appeared to.
 
 In short, the four-stream model needs to reason about fragment groups, not individual messages.

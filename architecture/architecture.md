@@ -8,10 +8,20 @@ a single-file Jython extension (`oracle_forms_burp.py`, 1140 lines) against Burp
 its protocol research, which is the valuable part, and rebuild the structure around it. Deviations are
 listed in [Corrections to the reference](#corrections-to-the-reference).
 
-> **Status: build order steps 1–5 implemented** (2026-08-13). `codec/`, `session/` and the Burp
-> wiring are in place with 73 unit and integration tests; the extension builds, loads, decodes
-> read-only, and persists keys. Steps 6 (`FhtWriter` and editing) and 7 (rules tab) remain, and the
-> protocol questions in §8 are still open pending byte-exact fixtures.
+> **Status: build order steps 1–5 and 6a–6e implemented** (2026-08-14). 185 unit and integration
+> tests. The extension builds, loads, decodes read-only, persists keys — and now sends: a captured
+> message can be drafted into Repeater as plaintext, edited property by property, and re-encrypted at
+> the live session's keystream position on Send, with the real client's session surviving intact.
+>
+> The send path has been **verified against a loaded extension in a running Burp** (2026-08-14): key
+> capture, offset and tail encryption, keystream continuity across sends, `Pragma` rewriting,
+> `NULLPOST` pass-through, fail-closed refusal and the marker trust rule all check out against an
+> independent RC4 implementation. What remains unverified is the *application* layer of §6.1 —
+> nothing has been sent to a real Forms server.
+>
+> Remaining: **6f** (Mode B session bootstrap, gated on §6.7 question 1), **6g** (response editing)
+> and **step 7** (rules tab). The protocol questions in §8 are still open pending byte-exact
+> fixtures.
 
 ---
 
@@ -223,11 +233,30 @@ extensionData()
                     ├── firstSeen  : Long (epoch millis)
                     ├── lastSeen   : Long
                     ├── label      : String   (user-editable note)
-                    └── source     : String   ("derived" | "manual" | "imported")
+                    └── source     : String   ("derived" | "manual" | "imported" | "bootstrap")
+        └── "streams"
+              └── <jsessionid>          absent until this session's streams diverge (§6.2)
+                    ├── clientRequestBytes  : Long
+                    ├── serverRequestBytes  : Long
+                    ├── serverResponseBytes : Long
+                    ├── clientResponseBytes : Long
+                    └── nextPragma          : Long
 ```
 
 `extensionData()` is scoped to the Burp project, which is the right lifetime: keys belong to the
 traffic captured in that project, and they survive both extension reload and Burp restart.
+
+The `streams` collection is what lets an edited or injected session survive an extension reload. RC4
+state is a pure function of the key and the bytes consumed, so four counters reconstruct all four
+ciphers with one `skip` each; `nextPragma` rides along because after an injection the session has a
+sequence number the capture has never seen. It is written **only once the four counters stop being
+equal** — before the first length-changing edit or Repeater injection they are derivable from proxy
+history, and writing them on every message would touch the project file for nothing. See §6.2.
+
+> **Correction (2026-08-14, on building it).** These counters were originally drawn as a *child* of
+> each session entry. They are a **sibling collection** instead, because `PersistedKeyStore.put`
+> replaces a session's entry wholesale — anything nested inside would be destroyed silently every
+> time a key was re-derived. Keeping them apart makes that impossible rather than merely avoided.
 
 ### Which cookie is the session id
 
@@ -307,17 +336,29 @@ oracleforms/
     StreamReplayer.java               key + ordered pragma bodies -> plaintext at pragma N
     Checkpoint.java                   RC4 state + string dictionary snapshot
     CheckpointCache.java              bounded LRU, in-memory only
+    SessionStreams.java               the four ciphers + byte counters for one session (§6.2)
+    StreamRegistry.java               bounded LRU of SessionStreams; rebuilds from history on miss
+    SessionTail.java                  where a session's streams have got to; refuses on a gap
+    InjectionPlan.java                the send decision: ciphertext + pragma, or a refusal
 
   burp/                             the only package that touches Montoya
-    persistence/PersistedKeyStore.java    SessionKeyStore over PersistedObject
+    persistence/PersistedKeyStore.java    SessionKeyStore and StreamPositionStore over PersistedObject
     history/PragmaHistorySource.java      pulls a session's pragmas from proxy history, filtered
-    handler/FormsHttpHandler.java         observes traffic; captures handshakes; live re-encrypt
+    handler/FormsHttpHandler.java         observes traffic; captures handshakes; keeps the ledger level
+    repeater/
+      SendToRepeaterMenu.java             context menu: send the decoded message to Repeater (§6.5)
+      DraftMarkers.java                   the X-OracleForms-* contract
+      RepeaterSendInterceptor.java        encrypts marked outbound bodies; strips the markers
     ui/
       FormsRequestEditorProvider.java  + FormsRequestEditor  (ExtensionProvidedHttpRequestEditor)
       FormsResponseEditorProvider.java + FormsResponseEditor
       SessionsTab.java                   the key store UI
       RulesTab.java                      auto-modification rules
 ```
+
+Everything under `session/` stays free of Montoya imports, including the new stream ledger: the
+arithmetic that keeps four ciphers consistent across an edit is the subtlest code in step 6 and has
+to be testable against a synthetic session with no running Burp.
 
 ### Why `StreamReplayer` and `PragmaHistorySource` are separate
 
@@ -355,6 +396,19 @@ key from store ─┬─ absent ──> "no key for this session" + offer manual
 The tab shows a pending state on a cache miss and repaints when the result arrives. Nothing slow
 happens on the EDT.
 
+**Outbound (step 6, §6).** The mirror image, and it runs in the opposite order: the editor holds
+plaintext and the handler encrypts at send time, because the correct keystream offset is not known
+until the moment the request actually leaves. Detection gains one case — a request carrying the
+`X-OracleForms-*` markers is a plaintext draft, not ciphertext — and the handler gains one rule: a
+marked request either encrypts successfully or never leaves Burp. See §6.5.
+
+**One addition to the hot-path budget.** The handler now also keeps an *already open* session ledger
+level with the traffic the real client is still generating, because otherwise a session goes stale
+the moment the client sends anything after a Repeater send, and the next send would encrypt at an
+offset the server has left behind. The cost is one hash lookup per Forms message and nothing at all
+for other traffic; the cipher only advances for a session the user has already sent into. Sessions
+nobody sends to never get past the lookup.
+
 **Failure is a first-class result.** `ParseOutcome` distinguishes a clean parse from one truncated at
 a byte offset, and the tab renders partial results *plus* an explicit "parsing stopped at offset N"
 line, falling back to a hex view. A malformed message from an untrusted target must never produce a
@@ -362,7 +416,28 @@ blank tab or a silent partial decode.
 
 ---
 
-## 6. Editing and the length problem
+## 6. Editing, and sending from Repeater
+
+The goal this section designs for: **send a captured Forms message to Repeater, change a value, press
+Send, and have the server accept it.** Everything below exists to make that one sentence true, and to
+be honest about where it stops being true.
+
+### 6.1 Three independent things must hold
+
+A Repeater send that "works" needs three separate properties. They are worth naming separately
+because every one of them fails the same way — the server returns an error page, or stalls, or tears
+the session down — while the fix for each is completely different.
+
+| Layer | Requirement | Who can guarantee it |
+| --- | --- | --- |
+| **Cryptographic** | The body must be RC4'd at exactly the keystream offset the server's request cipher currently sits at for this session. One byte out and the entire message is noise. | The extension, fully |
+| **Transport** | Cookies must name a session the server still holds, and the `Pragma` header must be the number it expects next. | The extension, fully |
+| **Application** | The Forms runtime is a state machine. A message referring to handler ids or UI objects that no longer exist is rejected even when it decrypts perfectly. | Nobody, in general — only mitigated (§6.4, Mode B) |
+
+The first two are engineering. The third is inherent to replaying against a stateful application, and
+the design's job is to make it *visible* rather than to pretend it away.
+
+### 6.2 The four-stream model
 
 The reference documents a real limitation: changing a string's length shifts the RC4 stream position
 for every later message in the session, breaking it. **This is fixable, and we should fix it.**
@@ -384,17 +459,305 @@ positions diverge and each side remains internally consistent:
 - Client encrypts P4 at its position `L3`; we decrypt with `clientRequestStream`, also at `L3`. ✓
 - We forward `P4'` encrypted with `serverRequestStream` at `L3'`; the server decrypts at `L3'`. ✓
 
-So arbitrary-length edits work **for live proxied traffic**, as long as the extension stays in the
-path and re-encrypts every subsequent message in that session. Two honest caveats: replaying a single
-message out of sequence from Repeater still desyncs the real session (inherent, not fixable), and if
-the extension is unloaded mid-session the streams are lost.
+**A Repeater injection is the same problem with the length going 0 → n.** That is the key
+realisation, and it is why Repeater support is not a separate mechanism: an injected message is a
+message the real client never sent, so from the client's point of view its length was zero and from
+the server's it was `n`. The four-stream ledger absorbs the difference exactly as it absorbs an edit.
 
-**Structural editing, not byte scanning.** The reference patches strings by scanning the plaintext for
-a two-byte header pattern, which can match arbitrary bytes inside string contents or image data and
-silently corrupt the message. Instead, `FhtParser` records the byte offset and length of every
-property value it reads, so an edit is applied at a known-good offset — or, better, the packet is
-re-serialized from the model via `FhtWriter`. Ship read-only decoding first; enable editing only once
-`FhtWriter` round-trips captured samples byte for byte.
+> An earlier version of this section said "replaying a single message out of sequence from Repeater
+> still desyncs the real session (inherent, not fixable)". **That is true only of replaying into the
+> middle of a session, which the four streams cannot help with because the server has already
+> consumed that stream position and will never return to it.** Appending to the *tail* of a session
+> is a different operation and is fully supported — see Mode A below. The two were conflated.
+
+What advances which stream:
+
+| Event | `clientRequest` | `serverRequest` | `serverResponse` | `clientResponse` |
+| --- | --- | --- | --- | --- |
+| Proxied request `P`, unmodified | +len(P) | +len(P) | — | — |
+| Proxied request `P`, edited to `P′` | +len(P) | +len(P′) | — | — |
+| Proxied request is `NULLPOST` | 0 | 0 | — | — |
+| Proxied response `R`, unmodified | — | — | +len(R) | +len(R) |
+| Proxied response `R`, edited to `R′` | — | — | +len(R) | +len(R′) |
+| **Repeater injection `X`** | **0** | **+len(X)** | **+len(reply)** | **0** |
+
+The Repeater row *is* the feature. The real client's ciphers never move, so the live session keeps
+working after an injection; the server's ciphers move, so the server keeps working too. Both sides
+stay internally consistent and neither can tell.
+
+**The four streams are cheap to persist and cheap to rebuild.** RC4 state is a pure function of the
+key and the number of bytes consumed, so the ledger is four `long` counters, not four 256-byte
+S-boxes. Rebuilding a stream is one `Rc4Stream.skip(n)`, which is milliseconds even for a session of
+several megabytes. So the "if the extension is unloaded mid-session the streams are lost" caveat is
+also removable: persist the counters under the session (§3) and the divergence survives a reload.
+Write them **only once a divergence exists** — before the first edit or injection all four are equal
+and reconstructible from proxy history, and writing on every message would hammer the project file
+for nothing.
+
+### 6.3 Structural editing, not byte scanning
+
+The reference patches strings by scanning the plaintext for a two-byte header pattern, which can
+match arbitrary bytes inside string contents or image data and silently corrupt the message. Instead,
+`FhtParser` records the byte offset and length of every property value it reads, so an edit is applied
+at a known-good offset.
+
+> **Correction (2026-08-14, on building it).** This section previously added "— or, better, the
+> packet is re-serialized from the model via `FhtWriter`". **That option does not exist, because
+> `FhtParser` is deliberately lossy.** It discards the delta-index byte on `ACTION_5`/`ACTION_6`
+> messages, keeps only the subtype and byte length of an `ExtValue` rather than its payload, resolves
+> back-references into plain strings without recording which dictionary slots produced them, and
+> never records the slot a literal string was stored into. Rebuilding a packet from that model would
+> silently rewrite bytes nobody asked to change — on a shared, continuous keystream, where a wrong
+> byte damages every message after it.
+>
+> So `FhtWriter` **splices**: it copies the original packet verbatim and replaces only the byte ranges
+> recorded for the properties actually edited. Everything untouched is untouched *by construction*,
+> which is a stronger guarantee than any test can give. Where the model is missing something the
+> encoding needs — a string's dictionary slot, a back-reference's slot pair, the type marker itself —
+> the writer reads it back out of the original bytes.
+
+**The identity gate.** Splicing is only as safe as the encoder producing the replacement, so before
+any edit is applied the writer re-encodes that property with its **unchanged** value and checks the
+result is byte-identical to what is already there. If the encoder cannot reproduce bytes it can read,
+it does not get to replace them.
+
+That check runs on every edit at runtime, not only in tests, and it is what lets the writer be honest
+about types it only partly understands: a property this codec gets subtly wrong shows up as a refused
+edit with a reason, not as a corrupted session. It also catches lossy *decoding* — a string whose
+bytes are not valid UTF-8 comes back through `FhtReader` as a replacement character, would re-encode
+to different bytes, and is therefore locked.
+
+**One promotion is deliberate.** Editing a back-referenced string rewrites it as a literal stored into
+the same destination slot. A back-reference's only effect besides its own value is that dictionary
+write, and a literal into the same slot performs exactly it, so any later property reading that slot
+sees the new text — which is what a user changing a string means. Nothing is promoted unless the value
+actually changes.
+
+### 6.4 Three send modes
+
+The extension cannot know which of these the user wants, and they have very different consequences,
+so the mode is chosen explicitly — at "Send to Repeater" time, and changeable in the tab afterwards.
+
+#### Mode A — append to the tail of a live session
+
+The default when the target session is known and its history has no gaps.
+
+- **Position**: the session's tail. Taken from the persisted `serverRequest` counter if a divergence
+  is on record, otherwise computed by replaying history to the highest captured pragma — the same
+  machinery `StreamReplayer` already uses to decode.
+- **Pragma**: rewritten to `highest + 1`. The captured number is kept only as provenance.
+- **Cookies**: rewritten to the session's most recently observed values. This matters specifically
+  for `JSESSIONID_FORMS`, which rotates every few messages (§3) — a stale value may route to a
+  backend that has never heard of the session.
+- **Effect**: the message lands in a live application session and the Forms runtime acts on it. This
+  is not a sandbox, and the UI must say so.
+- **Concurrency**: sends against one session must be **serialised**, because each one advances the
+  shared server-side stream. A consequence worth stating plainly: *Intruder with more than one thread
+  is broken by construction in this mode* — parallel payloads interleave into a single keystream and
+  destroy each other. Force single-threaded, or refuse.
+- **Gaps**: if history is missing a pragma, the tail offset is unknown. **Refuse the send; never
+  guess.** A wrong offset does not produce a polite error — it feeds the server bytes it reads as
+  garbage, and can take the user's live session down with it.
+
+#### Mode B — bootstrap a fresh session
+
+The repeatable one, and the honest answer to "I want to send this again tomorrow".
+
+1. `GET …?ifcmd=getinfo&…` → the response's `Set-Cookie` gives a new `JSESSIONID`.
+2. `POST` Pragma 1 with `GDay` + a fresh 4-byte random → `Mate` + server random → derive the key and
+   store it with `source = "bootstrap"`.
+3. Optionally **replay a captured prefix**: pragmas 3…N−1 from the source session, re-encrypted under
+   the *new* key, in order, honouring the `NULLPOST` rule outbound (send cleartext, advance nothing)
+   and consuming each response so the response stream keeps pace.
+4. Send the edited target message.
+
+Every request goes through `api.http().sendRequest()` (BApp criterion 7), on a background executor,
+cancellable. Because extension-issued requests re-enter registered `HttpHandler`s as
+`ToolType.EXTENSIONS`, the bootstrap must tag its own traffic so the handler's capture path does not
+recurse into it.
+
+The prefix replay is what makes the application layer (§6.1) tractable: it walks the server-side
+runtime into the state the target message assumes. Whether the server *accepts* a replayed prefix is
+an open question with a cheap experiment — see §6.7.
+
+#### Mode C — fixed offset, for inspection only
+
+Encrypt at the offset the message originally occupied. Correct for a live send only in the degenerate
+case where the target already *is* the tail. It exists for diffing ciphertext and exporting to other
+tools, and the UI must label it as not-for-sending rather than quietly offering it as an equal.
+
+### 6.5 Where the plaintext lives: the marker-header contract
+
+The Repeater tab has to hold *something*, and the choice determines everything else.
+
+**Rejected: hold the ciphertext, re-encrypt in `getRequest()`.** Burp calls `getRequest()` whenever it
+needs the message, not only at Send, so the send offset would have to be frozen at edit time — and by
+the time the user presses Send the session tail may have moved. It also leaves the raw tab showing
+ciphertext that no longer matches what the editor is displaying.
+
+**Chosen: the Repeater tab carries the FHT *plaintext*, plus marker headers. The HTTP handler
+encrypts at send time and strips the markers.** The handler is then the single owner of the crypto
+and the only place that needs to know a stream position, and it learns that position at the instant
+it is actually correct. As a bonus the raw tab becomes a usable hex editor for bytes the parser does
+not yet understand.
+
+```
+X-OracleForms-Session: <jsessionid>          which session's key and streams to use
+X-OracleForms-Send:    tail | bootstrap | offset=<n>
+X-OracleForms-Origin:  <captured pragma>     provenance, for display only
+```
+
+Handler rules, in order:
+
+1. **Honour the markers only from Burp's own tools** — `toolSource().isFromTool(REPEATER, INTRUDER,
+   EXTENSIONS)`. A marker on a proxied request was set by the client, and the client is the
+   application under test; treat it as untrusted, strip it, and ignore it (criterion 3). The check
+   sits behind the existing `lservlet` detection gate, so it adds nothing to the hot path for traffic
+   that is not ours.
+2. **Strip all three headers before the request leaves Burp, on every path including failures.**
+3. **Fail closed.** No key, no session, unknown position, encryption impossible — return
+   `RequestToBeSentAction.spoof(…)` with a synthetic response explaining why. The request never
+   leaves Burp, and the explanation appears in Repeater's response pane, which is where the user is
+   already looking. Silently sending a marked request unencrypted would put readable FHT — including
+   any credentials in it — on the wire.
+4. **`NULLPOST` outbound.** A plaintext body of exactly those eight bytes is sent cleartext and
+   advances nothing, mirroring the decode rule.
+5. **No `Content-Length` fixup is needed after encryption.** RC4 is length-preserving; the only
+   length change is the user's own edit, which Burp already accounts for when the editor hands back a
+   modified request.
+
+**The response leg.** Repeater responses never enter proxy history, so the replay-from-history path
+cannot reach them. The handler decrypts the reply against `serverResponseStream`, advances it, and
+puts the plaintext in a bounded LRU keyed by a hash of the ciphertext; the response editor checks
+that cache before falling back to replay. Hashing the ciphertext, rather than keying on (session,
+pragma), keeps repeated sends of different bodies from colliding.
+
+**Detection needs one addition.** A plaintext draft still looks like an encrypted message to
+`FormsDetector` — `lservlet` path, `Pragma ≥ 3`, a `JSESSIONID` — so the editor would try to replay
+and decode bytes that are already clear. `FormsTarget` gains a flag set from the marker, and the pane
+renders the body directly when it is set.
+
+### 6.6 Component additions
+
+As built (2026-08-14). Names marked ▲ were not in the original sketch; the reasons are below.
+
+```
+codec/                              pure, no Burp imports
+  FhtWriter.java                    splices edited properties into a packet; the identity gate (§6.3)
+  FhtEdit.java                    ▲ one pending change, bound to the parsed property not to an offset
+  FhtUnwritableException.java     ▲ checked: the caller must say what happens instead
+  PropertyValues.java             ▲ text <-> PropertyValue, shape-preserving, for editable cells
+
+session/                            stateful, no Burp imports
+  StreamLeg.java                  ▲ the four cipher relationships
+  SessionStreams.java               the four Rc4Streams + byte counters + next pragma
+  StreamPositions.java            ▲ the durable form: four longs and a sequence number
+  StreamPositionStore.java        ▲ persistence seam, so session/ stays Montoya-free
+  StreamRegistry.java               bounded LRU of SessionStreams; rebuilds from history on miss
+  SessionTail.java                ▲ measures a session's position, and refuses on an interior gap
+  StreamGapException.java         ▲ names the missing pragma, so a refusal is actionable
+  InjectionPlan.java              ▲ the send decision: bytes, pragma and offset, or a refusal
+  CookieHeader.java               ▲ refreshes the rotating cookie without discarding the user's
+
+burp/
+  DecodedBodyCache.java           ▲ plaintext for bodies history cannot reach (a Repeater reply)
+  repeater/
+    SendMode.java                 ▲ tail | offset, never defaulted
+    DraftMarkers.java             ▲ the X-OracleForms-* contract: parse, apply, strip
+    RepeaterSendInterceptor.java    the marker-header half of FormsHttpHandler
+    SendToRepeaterMenu.java         context menu: "Send decoded to Repeater (…)"
+  ui/
+    FhtDraftPanel.java            ▲ the property table; editability from FhtWriter.editRefusal
+    FormsRequestEditor              editable when EditorCreationContext.editorMode() is not READ_ONLY
+```
+
+**`OutboundEncoder` was not built.** It would have been a single method wrapping one call plus the
+`NULLPOST` rule, and that rule belongs next to the state it protects: it lives in
+`SessionStreams.apply` instead, beside the counters it must not advance.
+
+**`SessionBootstrap` was not built** — Mode B is still designed only, gated on §6.7 question 1.
+
+Everything in `session/` and `codec/` stays free of Montoya imports, for the same reason
+`StreamReplayer` does: the ledger arithmetic in §6.2 is the subtlest code in the feature and has to be
+testable against a synthetic session with no running Burp. That is what makes
+`RepeaterInjectionEndToEndTest` possible — it runs decode → edit → inject → *server reads it* → client
+carries on, with nothing stubbed but Burp itself.
+
+`RepeaterSendInterceptor` is a collaborator of `FormsHttpHandler`, not a second registered handler, so
+the ordering between key capture and send interception is deterministic rather than dependent on
+registration order.
+
+Editability is gated on `editorMode()`, which Burp already sets to `READ_ONLY` for proxy history.
+Proxy history therefore stays read-only for free, and the editable path only ever appears where an
+edit can mean something.
+
+### 6.7 Open questions, and the experiments that settle them
+
+All five need a live target, and all five are cheap once Mode B exists.
+
+1. **Does the server accept a replayed prefix in a fresh session?** The question Mode B rests on.
+   Bootstrap, replay pragmas 3…N from a capture, and compare each response structurally against the
+   captured one. Decisive either way.
+2. **Are handler ids stable across sessions?** If they are, a captured message can be sent into a
+   bootstrapped session without replaying the whole prefix, which turns Mode B from expensive into
+   cheap. Compare decoded property values across two captured sessions performing the same action.
+3. **Is the `Pragma` number validated or advisory?** Send one with a deliberately wrong number into a
+   bootstrapped session. Determines whether the tail number must be exact.
+4. **Does `JSESSIONID_FORMS` actually affect routing,** or does the route suffix inside `JSESSIONID`
+   carry it? Omit it in a bootstrapped session and see.
+5. **Does the server tolerate a length change?** It should — an FHT message is self-describing — but
+   the whole four-stream model is only worth building if it does.
+
+### 6.8 Build order for step 6
+
+Revised from the single line in §9, which predates all of the above. Each step is independently
+verifiable and the ones that can damage a live session come last.
+
+| | Step | Gate | Status |
+| --- | --- | --- | --- |
+| **6a** | `FhtWriter` + round-trip tests | decode→encode reproduces captured bytes exactly. Nothing below starts until this passes | **done** — per-property identity gate, enforced at runtime as well as in tests |
+| **6b** | `SessionStreams`, `StreamRegistry`, the four-stream ledger | unit tests over synthetic sessions, including an injected message and a length-changing edit. No UI, no Burp | **done** — `SessionStreamsTest` simulates client and server as separate parties |
+| **6c** | Marker-header contract and `RepeaterSendInterceptor`, Mode C only | a marked request encrypts to the same bytes as the capture it came from | **done** — `InjectionPlanTest.offsetModeReproducesTheOriginalCiphertext` |
+| **6d** | Editable request editor in Repeater, `FhtWriter`-backed | edit a property, see the plaintext change; markers survive the round trip | **done** — property table, editability and its refusal reason per row |
+| **6e** | Mode A tail append, per-session serialisation, refuse-on-gap | a modified message is accepted by a live session *and* the real client keeps working afterwards | **done** in simulation — `RepeaterInjectionEndToEndTest`. Not yet run against a live target |
+| **6f** | Mode B bootstrap and prefix replay | once experiment 1 in §6.7 has an answer | not built |
+| **6g** | Response editing, client-facing response leg | last, because fragment groups (§1) only bite here | not built |
+
+> **What "done" means for 6e.** Two levels of evidence, and neither is the application layer.
+>
+> *In simulation:* every claim in §6.2 is verified against a simulated client and server holding
+> their own continuous ciphers, including that the real client keeps working after an injection.
+>
+> *Against a live Burp* (2026-08-14): the deployed extension was driven through Burp's own HTTP stack
+> at a local listener standing in for the servlet, and the ciphertext it produced was checked against
+> an independent RC4 implementation. Key derivation, offset and tail encryption, keystream continuity
+> across consecutive sends, `Pragma` rewriting, `NULLPOST` pass-through, the fail-closed refusal and
+> the marker trust rule all hold. This is what found the `Content-Length` bug in the refusal response
+> that no simulation could reach.
+>
+> *Still unverified:* whether the Forms runtime **accepts** an appended message. That is the
+> application layer of §6.1 and it needs the real target — exactly what §6.7 cannot answer from
+> here.
+
+Two notes on ordering. **Request editing is unaffected by response fragmentation** — requests are
+small and are never split — so the concern raised in `features/improvements.md` about fragment
+groups applies only to 6g, and does not hold up the Repeater feature at all. And **6e is the first
+step that can perturb someone's live session**, which is the natural place to stop and reconsider
+rather than a thing to slide into.
+
+### 6.9 Honest limits
+
+- Mode A acts on a live application session. It is not a sandbox, and undoing it means restarting the
+  session.
+- Mode A needs the extension loaded, and needs the session's stream position known. Gaps in history
+  mean refusal, not a best guess.
+- The application layer (§6.1) cannot be guaranteed by anything the extension does. A message can be
+  cryptographically perfect and still be rejected because the runtime has moved on.
+- Repeater tabs and the project file will contain FHT **plaintext**, which is the point but is also a
+  new place for credentials to sit unencrypted. Same tradeoff as the key store (§3), and it belongs
+  in the README next to it.
+- Intruder is supported only as a consequence of the same contract, and only Mode B is safe to run
+  concurrently.
 
 ---
 
@@ -531,5 +894,8 @@ than reconstructing them from MCP output.
    request editor tab. First point the thing is usable.
 4. `SessionsTab` — key list, manual entry, retroactive history scan, export/import.
 5. Response editor tab, sensitive-value highlighting and proxy-history annotation.
-6. `FhtWriter` with round-trip tests, then editing and the four-stream model from §6.
-7. `RulesTab` auto-modification.
+6. **Editing and Repeater.** `FhtWriter` with round-trip tests, the four-stream ledger, the
+   marker-header contract, and the three send modes. This is no longer one step — it is seven, and
+   they are broken out with their gates in **§6.8**. Read that rather than this line.
+7. `RulesTab` auto-modification. Depends on step 6: a rule is an edit applied without interception,
+   so it needs the same `FhtWriter` and the same outbound encoder.

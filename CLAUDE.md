@@ -31,6 +31,7 @@ The full design rationale lives in `architecture/architecture.md`; the constrain
 - **Untrusted input**: message bodies come from the tested application. Parse defensively with bounded reads, and never deserialize attacker-controlled data into live Java objects (criterion 3).
 - **Threading**: capture keys on the proxy hot path and nothing else; decode on a background executor, never on the EDT (criterion 5).
 - **Bounded state**: every cache is an LRU and holds no long-term references to Burp objects (criterion 9).
+- **Sending is the mirror of decoding, and it fails closed.** Editing and Repeater (step 6) invert the pipeline: the editor holds FHT *plaintext* and the HTTP handler encrypts at send time, because the correct keystream offset is not known until the request actually leaves. A request marked as a plaintext draft either encrypts successfully or never leaves Burp — sending unencrypted FHT would put readable credentials on the wire. See `architecture/architecture.md` §6.
 - **No Java 8 constraint on the extension**: the *target application* runs on Java 8, but the extension itself builds and runs on Java 21 (see the toolchain below).
 
 ## Architecture
@@ -73,15 +74,22 @@ Reference docs (background, not maintained by us):
 
 ## Current State
 
-**Build order steps 1–5 are implemented** (`architecture/architecture.md` §9). The extension is called "Oracle Forms Decoder", builds to a loadable jar, and works read-only: it captures keys from live Pragma 1 handshakes, persists them to the Burp project file, and decodes any captured message on demand by replaying the RC4 stream from proxy history. 73 unit and integration tests pass (`./gradlew test`).
+**Build order steps 1–5 and 6a–6e are implemented** (`architecture/architecture.md` §9, §6.8). The extension is called "Oracle Forms Decoder", builds to a loadable jar, captures keys from live Pragma 1 handshakes, persists them to the Burp project file, decodes any captured message on demand by replaying the RC4 stream from proxy history — and **sends**: a captured message can be drafted into Repeater as plaintext, edited property by property, and re-encrypted at the live session's keystream position on Send. 185 unit and integration tests pass (`./gradlew test`).
 
 - `Extension.java` is a thin shell over `oracleforms.burp.OracleFormsDecoder`, which does the wiring and unloading.
 - `codec/` and `session/` have no Burp imports and are directly unit-tested.
 - `burp/` holds everything Montoya-facing: handler, persistence, history, editors, Sessions tab.
 
-**What remains:** step 6 (`FhtWriter`, round-trip tests, then editing and the four-stream model) and step 7 (rules tab).
+**What remains:** step 6f (Mode B session bootstrap, gated on architecture §6.7 question 1), step 6g (response editing) and step 7 (rules tab).
+
+**How the send path works** — read `architecture/architecture.md` §6 before touching any of it:
+
+- A Repeater injection is **the same problem as a length-changing edit**, with the length going 0 → n. The four-stream ledger (§6.2) covers both, which is why this is one mechanism and not two. It persists as four byte counters plus a sequence number, because RC4 state is a pure function of key and bytes consumed.
+- The Repeater tab holds **plaintext** plus `X-OracleForms-*` markers; `RepeaterSendInterceptor` encrypts at send time and strips them. §6.5 explains why `getRequest()` is the wrong place. It **fails closed** — a draft that cannot be encrypted is answered with a spoofed explanatory response and never leaves Burp.
+- `FhtWriter` **splices** rather than re-serializing, because `FhtParser` is lossy. Before every edit it re-encodes the property with its *unchanged* value and checks the bytes match — an encoder that cannot reproduce what it read does not get to replace it. That gate runs at runtime, not just in tests.
+- Two send modes are built (§6.4): append to a live session's tail, or encrypt at a fixed offset for inspection. The mode is never defaulted, because they differ in whether they act on a running application.
 
 **Two things to know before continuing:**
 
-1. **Key derivation is not yet validated against real traffic.** The Pragma 3 self-test described in the original §1 turned out to be vacuous — it passes for any key, right or wrong (see `changes/changes.md`, 2026-08-13). What replaced it validates the *stream-start assumption* without a key, but validating the *key* needs the 4-byte FHT opening constant, whose value is still unknown. Recovering it is the blocker; `Pragma3SelfTest.recoverOpeningConstant` run across the 22 captured sessions is the cheapest path.
-2. **All tests run against synthetic sessions, not the real capture.** They prove the code is self-consistent, not that the protocol assumptions are right. Byte-exact fixtures still need exporting from Burp — the MCP server renders bodies as escaped text and is lossy for binary.
+1. **Key derivation is not yet validated against real traffic.** The Pragma 3 self-test described in the original §1 turned out to be vacuous — it passes for any key, right or wrong (see `changes/changes.md`, 2026-08-13). What replaced it is `KeyValidation`, which decrypts pragma 3 with the derived key and checks it parses into real property ids against a control group of 32 random keys. That needs nothing known in advance — the 4-byte opening constant was never actually the blocker (architecture §8). What *is* missing is a byte-exact fixture file; `RealCaptureValidationTest` skips until one is exported from the Sessions tab.
+2. **All tests run against synthetic sessions, not the real capture, and nothing has been sent to a live target.** They prove the code is self-consistent, not that the protocol assumptions are right. For the send path specifically, what is verified is the *cryptographic* layer of §6.1 — the four-stream model is tested against a simulated client and server holding their own continuous ciphers. Whether the Forms runtime accepts an appended message is the *application* layer, and that needs the target. Byte-exact fixtures still need exporting from Burp — the MCP server renders bodies as escaped text and is lossy for binary.

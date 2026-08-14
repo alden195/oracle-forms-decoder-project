@@ -2,6 +2,7 @@ package oracleforms.burp.ui;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.ui.editor.extension.EditorCreationContext;
+import burp.api.montoya.ui.editor.extension.EditorMode;
 import burp.api.montoya.ui.editor.extension.ExtensionProvidedHttpRequestEditor;
 import burp.api.montoya.ui.editor.extension.ExtensionProvidedHttpResponseEditor;
 import burp.api.montoya.ui.editor.extension.HttpRequestEditorProvider;
@@ -26,7 +27,11 @@ public final class FormsEditorProviders {
             @Override
             public ExtensionProvidedHttpRequestEditor provideHttpRequestEditor(
                     EditorCreationContext context) {
-                return new FormsRequestEditor(api, decodeService);
+                // Burp creates proxy-history editors READ_ONLY, so gating on this keeps history
+                // read-only for free and puts the editable path only where an edit can mean
+                // something -- a Repeater tab (architecture §6.6).
+                return new FormsRequestEditor(
+                        api, decodeService, context.editorMode() != EditorMode.READ_ONLY);
             }
         };
     }

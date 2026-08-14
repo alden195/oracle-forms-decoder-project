@@ -19,6 +19,226 @@ What changed, in a sentence or two.
 
 ---
 
+## 2026-08-14 — Two fail-safe holes found by review
+
+A multi-agent review of the send path raised three findings. One was a false positive; the other two
+were real, and both had the same shape: a guarantee stated unconditionally in the design that the
+code only delivered conditionally.
+
+**1. The fail-closed contract rested on one method's error handling.**
+`FormsHttpHandler` wraps its work in `catch (RuntimeException)` and falls through to
+`continueWith(request)` — correct for ordinary traffic, and exactly wrong for a draft, whose body is
+FHT plaintext and whose markers have not yet been stripped. `RepeaterSendInterceptor.intercept` did
+catch around its own send, but the trust check ahead of it was *outside* that try, so a throw from
+`toolSource()` or `DraftMarkers.strip()` escaped to the handler and the draft went out as readable
+FHT with its markers attached. Architecture §6.5 states rules 2 and 3 with no exceptions in them.
+
+Fixed on both sides. Everything after the marked-request check now sits inside the interceptor's try;
+its refusal path can no longer throw either, falling back to `drop()` if even building the
+explanation fails. And the handler now checks for markers in its own catch and drops rather than
+forwards, so the guarantee no longer depends on one method being complete.
+
+**2. Stream counters outlived the key that produced them.**
+Persisting the counters in a collection *beside* the session entry, rather than inside it, is what
+stops `put()` destroying them whenever a key is re-derived — but it also let them survive a key
+*change*: a correction typed into the Sessions tab, a JSON import, or a fresh handshake with
+different randoms. RC4 state is a function of the key **and** the byte count, so a count accumulated
+under the old key describes nothing under the new one. The next send would seed a cipher with the new
+key, skip it to the old count, and encrypt at an arbitrary offset — which succeeds, and which the
+server reads as noise. Precisely the outcome §6.4 says must never be guessed at, arrived at without
+anyone guessing.
+
+Fixed by binding the counters to their key: `StreamPositions` now carries a digest of the key it was
+measured under, `StreamRegistry` refuses to resume a set that does not match and measures the session
+again instead, and `PersistedKeyStore.put` drops them when the key changes. The registry check is the
+load-bearing one, because it does not depend on every writer remembering; the `put` cleanup is
+hygiene. Counters written before the binding existed are treated as unidentifiable and rebuilt.
+
+**3. "The PR does not compile" — false positive.** The reviewer's checkout saw the eight modified
+files without the thirty-seven new ones, because at the time they were untracked and so absent from
+the diff it was given. Verified directly: the tree compiles, 185 tests pass, and the jar builds. Worth
+recording because the same scoping trap will catch the next review of a branch with new files in it.
+
+`KeyChangeInvalidatesStreamsTest` covers finding 2 end to end, including that a send after a key
+change still lands where a server holding the new key actually is. Finding 1 has no automated test:
+reproducing it means making a Montoya `HttpRequestToBeSent` throw, and constructing one needs Burp's
+object factory. That is the `burp/` coverage gap again — the fourth defect to land in it.
+
+## 2026-08-14 — Verified the send path against a live Burp; fixed a Content-Length bug
+
+The Repeater send path was exercised end to end against a **loaded extension in a running Burp**,
+rather than only in simulation, by issuing requests through Burp's own HTTP stack at a local listener
+standing in for the Forms servlet. That listener answers a `GDay` handshake with `Mate`, which is
+enough for the live extension to derive and store a key, after which drafts can be sent at it and the
+resulting ciphertext checked against an independent RC4 implementation in Python.
+
+**What passed, on the deployed extension:**
+
+- Live key capture from a Pragma 1 handshake, and the derived key matched an independent computation
+  of the §1 formula exactly (`4395ae4285`).
+- Offset mode: ciphertext byte-identical to independently computed `RC4(key)` from offset 0.
+- Tail mode: two consecutive sends encrypted at offsets 0 and 30 against **one continuous
+  keystream** — the ledger advances correctly across sends.
+- `Pragma` rewriting: a draft sent with `Pragma: 99` went out as 3, then 4, then 5, then 6.
+- Offset mode left the ledger untouched, proven by the first tail send afterwards still starting at
+  offset 0.
+- `NULLPOST` outbound: passed through as cleartext, and the following send still encrypted at offset
+  60 rather than 68 — the sentinel consumed no keystream.
+- Fail-closed: a draft for a session with no stored key produced the 599 refusal and **nothing
+  reached the listener**.
+- The trust rule: the same markers sent *through the Burp proxy* were stripped and ignored, and the
+  body went out unencrypted. Honoured only from Burp's own tools, exactly as specified.
+
+**The bug.** The refusal response computed `Content-Length` from the body's **UTF-8** byte count and
+then handed the whole message to `HttpResponse.httpResponse(String)`, which Burp encodes as Latin-1.
+Every multi-byte character shrank on the way out while the header kept the larger count. Two em
+dashes in the "no key is stored" message were enough: a live refusal declared 391 bytes and sent
+fewer, and a client honouring `Content-Length` waits for a remainder that never comes.
+
+Fixed by assembling the response as bytes — ASCII header block, UTF-8 body, length taken from the
+body array — so the declared length is the real one whatever the reason contains. That matters beyond
+the em dashes, because one refusal interpolates a session id read straight off a request header and
+so is not the extension's to trust (criterion 3). The em dashes were also replaced with ASCII, which
+is the same decision `FormsEditorPane` already documents for rendered output.
+
+`RefusalResponseTest` pins the invariant for ASCII, multi-byte characters, hostile session ids, an
+empty reason, and CRLF in the reason. 180 tests.
+
+**Why simulation missed it:** every existing test drives `InjectionPlan` and `SessionStreams`
+directly, and none of them construct a Montoya `HttpResponse` — that needs a running Burp. This is
+the `burp/` coverage gap `features/improvements.md` item 1 has been warning about, landing a third
+bug.
+
+**Affects:** `burp/repeater/RepeaterSendInterceptor.java`,
+`burp/repeater/RefusalResponseTest.java` (new).
+
+## 2026-08-14 — Built step 6a–6e: Repeater injection works
+
+The design from earlier today is now implemented. A captured message can be drafted into Repeater as
+plaintext, edited property by property, and re-encrypted at the live session's keystream position on
+Send — with the real client's session surviving intact. 174 tests, up from 104.
+
+Five things came out differently from the design, and four of them are corrections to it.
+
+**1. `FhtWriter` splices; it does not re-serialize.** §6.3 preferred rebuilding the packet from the
+model. That option does not exist: `FhtParser` is deliberately lossy — it drops the `ACTION_5`/`6`
+delta byte, keeps only an `ExtValue`'s subtype and length, resolves back-references into plain
+strings without recording the slots involved, and never records the slot a literal string was stored
+into. Re-serializing would silently rewrite bytes nobody asked to change, on a shared continuous
+keystream where a wrong byte damages every message after it. So the writer copies the original and
+replaces only the byte ranges of the properties actually edited; where the model lacks something the
+encoding needs, it reads it back out of the original bytes.
+
+**Why that is better rather than merely necessary:** untouched bytes are untouched *by construction*,
+which no test can promise. And it made room for the **identity gate** — before any edit is applied,
+the property is re-encoded with its own *unchanged* value and compared against what is already there.
+An encoder that cannot reproduce bytes it can read does not get to replace them. That runs at
+runtime on every edit, not just in tests, so a type this codec gets subtly wrong surfaces as a
+refused edit with a reason instead of a corrupted session. It also catches lossy *decoding*: a string
+whose bytes are not valid UTF-8 comes back as a replacement character, would re-encode differently,
+and is locked.
+
+**2. The persisted stream counters are a sibling of the session entry, not a child.**
+`PersistedKeyStore.put` replaces a session's entry wholesale, so counters nested inside would have
+been destroyed every time a key was re-derived. Separating them makes that impossible rather than
+merely avoided. A fifth field, `nextPragma`, rides along — after an injection the session has a
+sequence number the capture has never seen, so it is not derivable either.
+
+**3. `OutboundEncoder` was not built.** It would have been one method wrapping one call plus the
+`NULLPOST` rule, and that rule belongs next to the state it protects. It lives in
+`SessionStreams.apply`, beside the counters it must not advance.
+
+**4. The handler does slightly more on the hot path than §5 allowed.** It now keeps an *already open*
+session ledger level with traffic the real client is still generating. Without it a session goes
+stale the moment the client sends anything after a Repeater send, and the next send would encrypt at
+an offset the server has left behind — the exact failure the design exists to prevent. The cost is
+one hash lookup per Forms message, and the cipher only advances for a session the user has already
+sent into.
+
+**5. `§6.2`'s claim was tested by simulation, and it holds.** `SessionStreamsTest` stands up an
+independent client and server, each with their own continuous per-direction ciphers, and puts the
+ledger between them. `RepeaterInjectionEndToEndTest` then runs the whole chain on real FHT packets:
+replay a captured message, edit a string to something longer, plan a tail injection, have the
+*server* decrypt and parse it and see the change, then keep the real client talking for ten more
+messages in both directions. The offset-mode test is the sharpest of the set — an unedited draft must
+re-encrypt to the captured ciphertext byte for byte, so an offset that is wrong by one fails it.
+
+**Fail-closed, as specified.** A draft that cannot be encrypted is answered with
+`RequestToBeSentAction.spoof` carrying a plain-text explanation, so the request never leaves Burp and
+the reason appears in Repeater's response pane. Markers are honoured only from Repeater, Intruder and
+extensions — one on proxied traffic was set by the application under test — and are stripped on every
+path out.
+
+**What is not built:** Mode B (bootstrap a fresh session), which is gated on §6.7 question 1, and
+response editing, which is where fragment groups bite. **And nothing here has been run against a live
+target.** What is verified is the cryptographic layer of §6.1; whether the Forms runtime accepts an
+appended message is precisely what cannot be answered without it.
+
+**Affects:** new — `codec/FhtWriter`, `FhtEdit`, `FhtUnwritableException`, `PropertyValues`;
+`session/StreamLeg`, `SessionStreams`, `StreamPositions`, `StreamPositionStore`, `StreamRegistry`,
+`SessionTail`, `StreamGapException`, `InjectionPlan`, `CookieHeader`; `burp/DecodedBodyCache`,
+`burp/repeater/*`, `burp/ui/FhtDraftPanel`. Changed — `PragmaSource`, `PragmaHistorySource`,
+`PersistedKeyStore`, `DecodeService`, `FormsHttpHandler`, `FormsRequestEditor`,
+`FormsEditorProviders`, `OracleFormsDecoder`. Docs — `architecture/architecture.md` (§3, §4, §5, §6.3,
+§6.6, §6.8, status), `features/features.md`, `CLAUDE.md`, `README.md`, `summary.md`.
+
+## 2026-08-14 — Designed step 6: sending a modified message from Repeater
+
+Documentation only; no code changed and all 104 tests still pass. Architecture §6 grew from a
+30-line note about length-changing edits into the full design for the workflow the extension is
+missing: send a captured message to Repeater, change a value, press Send, have the server accept it.
+
+Four decisions carry the design.
+
+**A Repeater injection is a length-changing edit with the length going 0 → n.** The four-stream model
+already in §6 was written for edits, but it turns out to cover injection exactly: from the real
+client's point of view the injected message had length zero, from the server's it had length `n`, and
+four independent ciphers absorb the difference. That collapses what looked like two features into
+one mechanism, and it *reverses* a claim the document previously made — §6 said replaying from
+Repeater "still desyncs the real session (inherent, not fixable)". That is true of replaying into the
+*middle* of a session, and false of appending to its *tail*; the two were conflated. Appending is
+fully supported.
+
+**The four streams are four `long`s, not four S-boxes.** RC4 state is a pure function of the key and
+the bytes consumed, so the ledger persists as four counters and rebuilds with one `skip` each. That
+removes the old caveat that "if the extension is unloaded mid-session the streams are lost" — the
+divergence now survives a reload for the cost of four longs in the project file, written only once
+the counters stop being equal. §3's persistence schema gained a `streams` child.
+
+**The Repeater tab carries plaintext; the handler encrypts at send.** The obvious alternative — hold
+ciphertext and re-encrypt in `getRequest()` — fails because Burp calls `getRequest()` whenever it
+needs the message, so the keystream offset would be frozen at edit time, and by the time the user
+presses Send the session tail may have moved. Putting the crypto in the handler means it happens once,
+at the moment the correct offset is finally knowable. The cost is a marker-header contract
+(`X-OracleForms-*`) and a hard rule: markers are honoured only from Burp's own tools, are stripped on
+every path, and a marked request that cannot be encrypted is answered with a spoofed explanatory
+response rather than sent. Sending unencrypted FHT would put readable credentials on the wire.
+
+**Three send modes, chosen explicitly.** Append to a live session's tail; bootstrap a fresh session
+and optionally replay a captured prefix; or encrypt at the captured offset for inspection only. They
+differ in what they do to a live application session, and the difference is too large to pick a
+default silently. Mode A also forces per-session serialisation, which makes explicit something that
+would otherwise be discovered painfully: *Intruder with more than one thread is broken by construction
+against this protocol*, because parallel payloads interleave into one keystream.
+
+The section also separates three layers of validity — cryptographic, transport, application — because
+all three fail identically from the outside and only the first two are the extension's to guarantee.
+Five open questions with their experiments are in §6.7, and §6.8 replaces the one-line step 6 in the
+build order with seven gated sub-steps.
+
+**Why now:** the request was for the Repeater workflow, and the previous §6 was not a design so much
+as a note that editing would be hard, with one sentence that was actively wrong about whether
+Repeater could work at all. Writing it down first also surfaced the persistence and concurrency
+consequences, neither of which would have been obvious mid-implementation.
+
+**Also corrected while here:** `CLAUDE.md` still described the 4-byte FHT opening constant as the
+blocker for validating key derivation, which §8 had already retracted — `KeyValidation` needs nothing
+known in advance, and the real gap is a byte-exact fixture file. Test counts in `CLAUDE.md` and
+architecture's status banner were stale at 73; the suite is 104.
+
+**Affects:** `architecture/architecture.md` (§3 schema, §4 tree, §5 outbound flow, §6 rewritten, §9
+step 6), `CLAUDE.md`, `features/features.md`, `features/improvements.md`, `README.md`.
+
 ## 2026-08-13 — Prepared for publication: identifiers redacted
 
 The project was put under version control for upload to a git remote, which meant deciding what to do

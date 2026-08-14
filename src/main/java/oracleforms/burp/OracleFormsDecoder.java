@@ -10,6 +10,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.SwingUtilities;
 import oracleforms.burp.handler.FormsHttpHandler;
 import oracleforms.burp.persistence.PersistedKeyStore;
+import oracleforms.burp.repeater.RepeaterSendInterceptor;
+import oracleforms.burp.repeater.SendToRepeaterMenu;
 import oracleforms.burp.ui.FormsEditorProviders;
 import oracleforms.burp.ui.SessionsTab;
 import oracleforms.session.DictionaryScope;
@@ -17,6 +19,8 @@ import oracleforms.session.GdayMateKeyDerivation;
 import oracleforms.session.InMemorySessionKeyStore;
 import oracleforms.session.KeyDerivation;
 import oracleforms.session.SessionKeyStore;
+import oracleforms.session.StreamPositionStore;
+import oracleforms.session.StreamRegistry;
 
 /**
  * Wires the decoder together and takes it apart again.
@@ -48,6 +52,8 @@ public final class OracleFormsDecoder {
     private DecodeService decodeService;
     private FormsHttpHandler httpHandler;
     private SessionsTab sessionsTab;
+    private StreamRegistry streamRegistry;
+    private RepeaterSendInterceptor sendInterceptor;
     private MontoyaApi lastApi;
 
     public void initialize(MontoyaApi api) {
@@ -58,10 +64,17 @@ public final class OracleFormsDecoder {
         SessionKeyStore keyStore = openKeyStore(api);
 
         decodeService = new DecodeService(api, keyStore, DICTIONARY_SCOPE);
-        httpHandler = new FormsHttpHandler(keyStore, derivation, api.logging(), ANNOTATE_HISTORY);
+        streamRegistry = new StreamRegistry(streamPositionStore(keyStore));
+        sendInterceptor = new RepeaterSendInterceptor(
+                keyStore, streamRegistry, decodeService::historyFor, decodeService, api.logging());
+        httpHandler = new FormsHttpHandler(
+                keyStore, derivation, api.logging(), ANNOTATE_HISTORY, sendInterceptor,
+                streamRegistry);
         sessionsTab = buildSessionsTab(api, keyStore, derivation);
 
         registrations.add(api.http().registerHttpHandler(httpHandler));
+        registrations.add(api.userInterface().registerContextMenuItemsProvider(
+                new SendToRepeaterMenu(api, decodeService)));
         registrations.add(api.userInterface().registerHttpRequestEditorProvider(
                 FormsEditorProviders.requestProvider(api, decodeService)));
         registrations.add(api.userInterface().registerHttpResponseEditorProvider(
@@ -104,6 +117,17 @@ public final class OracleFormsDecoder {
             api.logging().logToError("Oracle Forms: could not build the Sessions tab: " + e.getCause());
         }
         return built.get();
+    }
+
+    /**
+     * The stream-position store, when the key store is one.
+     *
+     * <p>The in-memory fallback is not, and that is the right answer rather than an omission: if the
+     * project file could not be opened there is nowhere durable to record a divergence, and
+     * pretending otherwise would promise a ledger that silently vanishes on reload.
+     */
+    private static StreamPositionStore streamPositionStore(SessionKeyStore keyStore) {
+        return keyStore instanceof StreamPositionStore store ? store : StreamPositionStore.none();
     }
 
     /**
@@ -160,6 +184,14 @@ public final class OracleFormsDecoder {
         if (httpHandler != null) {
             httpHandler.shutdown();
             httpHandler = null;
+        }
+        if (sendInterceptor != null) {
+            sendInterceptor.shutdown();
+            sendInterceptor = null;
+        }
+        if (streamRegistry != null) {
+            streamRegistry.clear();
+            streamRegistry = null;
         }
         if (sessionsTab != null) {
             sessionsTab.shutdown();

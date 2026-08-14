@@ -32,7 +32,7 @@ import oracleforms.session.StreamReplayer;
  * <p>All caches are bounded LRUs holding plain arrays and strings, never Burp objects
  * (criterion 9), and {@link #shutdown()} releases the executor and every cache (criterion 6).
  */
-public final class DecodeService {
+public final class DecodeService implements DecodedBodyCache {
 
     /** Decoded text kept for recently viewed messages. */
     private static final int MAX_CACHED_RESULTS = 200;
@@ -40,8 +40,29 @@ public final class DecodeService {
     /** Session history indexes kept in memory. Each holds one session's bodies. */
     private static final int MAX_CACHED_SESSIONS = 3;
 
+    /** Bodies decoded outside the replay path -- Repeater sends and their replies. */
+    private static final int MAX_DIRECT_PLAINTEXTS = 64;
+
     /** What the editor displays. */
     public record DecodeResult(String text, boolean decoded) {
+    }
+
+    /**
+     * The decrypted bytes of a message, or the reason there are none.
+     *
+     * <p>Separate from {@link DecodeResult} because the send path needs the bytes themselves, not a
+     * rendering of them: a draft's body is FHT plaintext that the writer will edit and the
+     * interceptor will re-encrypt.
+     */
+    public record Plaintext(byte[] bytes, String failure) {
+
+        public boolean ok() {
+            return bytes != null;
+        }
+
+        static Plaintext failed(String reason) {
+            return new Plaintext(null, reason);
+        }
     }
 
     private record ResultKey(String sessionId, Direction direction, int pragma) {
@@ -56,6 +77,7 @@ public final class DecodeService {
 
     private final Map<ResultKey, DecodeResult> results;
     private final Map<String, PragmaHistorySource> histories;
+    private final Map<String, byte[]> directPlaintexts;
 
     public DecodeService(MontoyaApi api, SessionKeyStore keyStore, DictionaryScope scope) {
         this.api = api;
@@ -79,6 +101,45 @@ public final class DecodeService {
 
         this.results = boundedMap(MAX_CACHED_RESULTS);
         this.histories = boundedMap(MAX_CACHED_SESSIONS);
+        this.directPlaintexts = boundedMap(MAX_DIRECT_PLAINTEXTS);
+    }
+
+    // ---- DecodedBodyCache -----------------------------------------------------------------
+
+    @Override
+    public void put(byte[] ciphertext, byte[] plaintext) {
+        if (ciphertext == null || ciphertext.length == 0 || plaintext == null) {
+            return;
+        }
+        synchronized (directPlaintexts) {
+            directPlaintexts.put(fingerprint(ciphertext), plaintext.clone());
+        }
+    }
+
+    @Override
+    public Optional<byte[]> get(byte[] ciphertext) {
+        if (ciphertext == null || ciphertext.length == 0) {
+            return Optional.empty();
+        }
+        synchronized (directPlaintexts) {
+            return Optional.ofNullable(directPlaintexts.get(fingerprint(ciphertext)))
+                    .map(byte[]::clone);
+        }
+    }
+
+    /**
+     * A content hash of a body, used as the cache key.
+     *
+     * <p>SHA-256 rather than {@code Arrays.hashCode} because a collision here would show one
+     * message's plaintext against another's bytes, which is a decoding lie rather than a cache miss.
+     */
+    private static String fingerprint(byte[] body) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(body);
+            return java.util.HexFormat.of().formatHex(digest, 0, 16);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required by every Java platform", e);
+        }
     }
 
     private static <K, V> Map<K, V> boundedMap(int maxEntries) {
@@ -134,6 +195,47 @@ public final class DecodeService {
         }
     }
 
+    /**
+     * The decrypted bytes of a message, off the EDT.
+     *
+     * <p>Used when sending a decoded message to Repeater. Unlike {@link #decode}, this does not
+     * render or cache anything — the caller wants the bytes.
+     */
+    public CompletableFuture<Plaintext> plaintextOf(
+            FormsDetector.FormsTarget target, Direction direction, byte[] rawBody) {
+
+        if (!target.isEncrypted()) {
+            return CompletableFuture.completedFuture(new Plaintext(rawBody.clone(), null));
+        }
+        try {
+            return CompletableFuture.supplyAsync(() -> {
+                Optional<byte[]> direct = get(rawBody);
+                if (direct.isPresent()) {
+                    return new Plaintext(direct.get(), null);
+                }
+                Optional<SessionKey> key = keyStore.get(target.sessionId());
+                ReplayResult replayed = replay(target, direction, key.orElse(null));
+                if (replayed instanceof ReplayResult.MissingPragma) {
+                    invalidateHistory(target.sessionId());
+                    replayed = replay(target, direction, key.orElse(null));
+                }
+                if (replayed instanceof ReplayResult.Decrypted decrypted) {
+                    return new Plaintext(decrypted.plaintext(), null);
+                }
+                if (replayed instanceof ReplayResult.NullPost) {
+                    return new Plaintext(rawBody.clone(), null);
+                }
+                return Plaintext.failed(replayed.describe());
+            }, executor).exceptionally(throwable -> {
+                api.logging().logToError("Oracle Forms: plaintext extraction failed: " + throwable);
+                return Plaintext.failed("Decoding failed unexpectedly: " + throwable);
+            });
+        } catch (RejectedExecutionException e) {
+            return CompletableFuture.completedFuture(
+                    Plaintext.failed("The Oracle Forms extension has been unloaded."));
+        }
+    }
+
     private DecodeResult decodeNow(
             FormsDetector.FormsTarget target, Direction direction, byte[] rawBody) {
 
@@ -142,6 +244,18 @@ public final class DecodeService {
 
         if (!target.isEncrypted()) {
             return new DecodeResult(FhtRenderer.renderCleartext(rawBody, label + " (cleartext)"), true);
+        }
+
+        // A body decoded outside the replay path -- a Repeater reply -- is already plaintext here,
+        // and history has no record of it to replay from.
+        Optional<byte[]> direct = get(rawBody);
+        if (direct.isPresent()) {
+            FhtPacket packet = parser.parse(direct.get(), new oracleforms.codec.StringDictionary());
+            return new DecodeResult(
+                    FhtRenderer.render(packet, label + " (sent from Burp)", direct.get(),
+                            new ReplayResult.FragmentGroup(
+                                    target.pragma(), target.pragma(), target.pragma(), true)),
+                    packet.outcome().isComplete());
         }
 
         Optional<SessionKey> key = keyStore.get(target.sessionId());
@@ -185,8 +299,14 @@ public final class DecodeService {
                 target.sessionId(), key, direction, target.pragma(), historyFor(target.sessionId()));
     }
 
-    /** The session's history index, built on first use and cached. */
-    private PragmaHistorySource historyFor(String sessionId) {
+    /**
+     * The session's history index, built on first use and cached.
+     *
+     * <p>Public because the send path needs the same index this one does: measuring a session's tail
+     * walks exactly the bodies a decode walks, and building a second copy would double both the scan
+     * and the memory.
+     */
+    public PragmaHistorySource historyFor(String sessionId) {
         synchronized (histories) {
             PragmaHistorySource cached = histories.get(sessionId);
             if (cached != null) {
@@ -233,6 +353,9 @@ public final class DecodeService {
         }
         synchronized (histories) {
             histories.clear();
+        }
+        synchronized (directPlaintexts) {
+            directPlaintexts.clear();
         }
         checkpoints.clear();
     }

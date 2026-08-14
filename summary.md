@@ -9,9 +9,9 @@ Forms or Burp's extension API specifically.
 | | |
 | --- | --- |
 | **Language / platform** | Java 21, Burp Suite Montoya API 2026.7, Gradle (Kotlin DSL) |
-| **Size** | 5,554 lines of main source across 45 files; 2,639 lines of tests across 15 files |
-| **Tests** | 104, all passing |
-| **Status** | Read-only decoding complete and working; editing and rule-based modification not yet built |
+| **Size** | 8,439 lines of main source across 64 files; 4,552 lines of tests across 24 files |
+| **Tests** | 185, all passing |
+| **Status** | Decoding and Repeater sending complete (architecture §6, steps 6a–6e); session bootstrap, response editing and rule-based modification not yet built |
 
 ---
 
@@ -375,11 +375,17 @@ partway through loading.
 history, on-demand decoding in both directions with gap reporting, fragment reassembly, sensitive
 value highlighting, and a session management interface with manual key entry and import/export.
 
-**Not yet built:** message *editing*. Re-encoding requires a writer that can reproduce captured
-messages byte for byte, because any length change shifts the keystream position for every later
-message in the session. Shipping editing before that is verified would corrupt sessions. A design for
-handling this exists (maintaining separate cipher states toward the client and toward the server) but
-is not implemented.
+**Not yet built:** message *editing*, and sending a modified message from **Repeater**. Re-encoding
+requires a writer that can reproduce captured messages byte for byte, because any length change shifts
+the keystream position for every later message in the session. Shipping editing before that is
+verified would corrupt sessions.
+
+A full design for both now exists in `architecture/architecture.md` §6 but is not implemented. Its
+core claim: maintaining separate cipher states toward the client and toward the server covers a
+Repeater injection as well as an edit — an injected message has length zero as far as the real client
+is concerned and length *n* as far as the server is concerned, which is the same asymmetry an edit
+creates. §6.8 breaks the work into seven gated sub-steps, and §6.7 lists the five questions about the
+server that only a live target can answer.
 
 **The most important limitation:** the key derivation formula is **not yet validated against real
 captured bytes**. Every test to date builds its own session using the same formula it is checking, so
@@ -406,4 +412,4 @@ outcome than the decoder itself.
    persistence plus replay makes historical traffic readable, which the existing tool cannot do.
 5. Show a fragmented response (pragmas 7–10 in the capture) reassembled into one message, with the
    tool stating which pragmas it joined.
-6. Run `./gradlew test` — 104 tests.
+6. Run `./gradlew test` — 185 tests.
