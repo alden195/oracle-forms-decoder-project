@@ -10,6 +10,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.SwingUtilities;
 import oracleforms.burp.handler.FormsHttpHandler;
 import oracleforms.burp.persistence.PersistedKeyStore;
+import oracleforms.burp.proxy.InterceptEditService;
+import oracleforms.burp.proxy.InterceptTokens;
 import oracleforms.burp.repeater.RepeaterSendInterceptor;
 import oracleforms.burp.repeater.SendToRepeaterMenu;
 import oracleforms.burp.ui.FormsEditorProviders;
@@ -54,6 +56,7 @@ public final class OracleFormsDecoder {
     private SessionsTab sessionsTab;
     private StreamRegistry streamRegistry;
     private RepeaterSendInterceptor sendInterceptor;
+    private InterceptEditService interceptEditService;
     private MontoyaApi lastApi;
 
     public void initialize(MontoyaApi api) {
@@ -66,17 +69,22 @@ public final class OracleFormsDecoder {
         decodeService = new DecodeService(api, keyStore, DICTIONARY_SCOPE);
         streamRegistry = new StreamRegistry(streamPositionStore(keyStore));
         sendInterceptor = new RepeaterSendInterceptor(
-                keyStore, streamRegistry, decodeService::historyFor, decodeService, api.logging());
+                keyStore, streamRegistry, decodeService::historyFor, decodeService, api.logging(),
+                decodeService.background());
+        interceptEditService = new InterceptEditService(
+                keyStore, streamRegistry, decodeService::historyFor,
+                decodeService::invalidateHistory, new InterceptTokens(),
+                decodeService.background(), api.logging());
         httpHandler = new FormsHttpHandler(
                 keyStore, derivation, api.logging(), ANNOTATE_HISTORY, sendInterceptor,
-                streamRegistry);
+                streamRegistry, interceptEditService);
         sessionsTab = buildSessionsTab(api, keyStore, derivation);
 
         registrations.add(api.http().registerHttpHandler(httpHandler));
         registrations.add(api.userInterface().registerContextMenuItemsProvider(
                 new SendToRepeaterMenu(api, decodeService)));
         registrations.add(api.userInterface().registerHttpRequestEditorProvider(
-                FormsEditorProviders.requestProvider(api, decodeService)));
+                FormsEditorProviders.requestProvider(api, decodeService, interceptEditService)));
         registrations.add(api.userInterface().registerHttpResponseEditorProvider(
                 FormsEditorProviders.responseProvider(api, decodeService)));
         if (sessionsTab != null) {
@@ -188,6 +196,12 @@ public final class OracleFormsDecoder {
         if (sendInterceptor != null) {
             sendInterceptor.shutdown();
             sendInterceptor = null;
+        }
+        if (interceptEditService != null) {
+            // Revokes every unspent capability, so a token minted before a reload cannot authorise
+            // an edit against a ledger that no longer exists.
+            interceptEditService.shutdown();
+            interceptEditService = null;
         }
         if (streamRegistry != null) {
             streamRegistry.clear();

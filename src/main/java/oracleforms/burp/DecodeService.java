@@ -1,9 +1,14 @@
 package oracleforms.burp;
 
 import burp.api.montoya.MontoyaApi;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -68,6 +73,18 @@ public final class DecodeService implements DecodedBodyCache {
     private record ResultKey(String sessionId, Direction direction, int pragma) {
     }
 
+    /**
+     * Told when a message's decoded bytes are superseded after it was first rendered.
+     *
+     * <p>Exists for one case, and it is not cosmetic: the reply to a Repeater send is first decoded
+     * at the ledger's offset and only afterwards, on the decode executor, at the offset
+     * {@link oracleforms.session.ReplyOffsetRecovery} solves for. Without a way to say "that reading
+     * has been replaced", the corrected one is computed and then never seen.
+     */
+    public interface DecodeUpdateListener {
+        void decodeUpdated(String sessionId, Direction direction, int pragma);
+    }
+
     private final MontoyaApi api;
     private final SessionKeyStore keyStore;
     private final CheckpointCache checkpoints;
@@ -78,6 +95,22 @@ public final class DecodeService implements DecodedBodyCache {
     private final Map<ResultKey, DecodeResult> results;
     private final Map<String, PragmaHistorySource> histories;
     private final Map<String, byte[]> directPlaintexts;
+
+    /** Which rendered result each direct plaintext produced, so it can be dropped if superseded. */
+    private final Map<String, ResultKey> directRenderedAs;
+
+    /** Caveats to show beside a direct plaintext, for readings that are shown but not trusted. */
+    private final Map<String, String> directNotes;
+
+    /**
+     * Open editors wanting to know about a superseded decode.
+     *
+     * <p>Weak: Burp creates an editor per view and never says when one is discarded, so a strong
+     * registry would retain every tab the user has ever opened (criterion 9). Each pane keeps itself
+     * alive by being the component Burp is holding.
+     */
+    private final Set<DecodeUpdateListener> listeners =
+            Collections.newSetFromMap(new WeakHashMap<>());
 
     public DecodeService(MontoyaApi api, SessionKeyStore keyStore, DictionaryScope scope) {
         this.api = api;
@@ -102,17 +135,98 @@ public final class DecodeService implements DecodedBodyCache {
         this.results = boundedMap(MAX_CACHED_RESULTS);
         this.histories = boundedMap(MAX_CACHED_SESSIONS);
         this.directPlaintexts = boundedMap(MAX_DIRECT_PLAINTEXTS);
+        this.directRenderedAs = boundedMap(MAX_DIRECT_PLAINTEXTS);
+        this.directNotes = boundedMap(MAX_DIRECT_PLAINTEXTS);
+    }
+
+    /**
+     * The decode executor, for work that must not run on a Burp thread.
+     *
+     * <p>Shared rather than given its own pool because it is the same kind of work under the same
+     * lifetime: bounded, cancellable, and shut down with this service on unload (BApp criteria 5
+     * and 6). A second pool would be a second thing to remember to stop.
+     */
+    public java.util.concurrent.Executor background() {
+        return executor;
     }
 
     // ---- DecodedBodyCache -----------------------------------------------------------------
 
     @Override
     public void put(byte[] ciphertext, byte[] plaintext) {
+        put(ciphertext, plaintext, null);
+    }
+
+    @Override
+    public void put(byte[] ciphertext, byte[] plaintext, String note) {
         if (ciphertext == null || ciphertext.length == 0 || plaintext == null) {
             return;
         }
+        String fingerprint = fingerprint(ciphertext);
+        byte[] previous;
         synchronized (directPlaintexts) {
-            directPlaintexts.put(fingerprint(ciphertext), plaintext.clone());
+            previous = directPlaintexts.put(fingerprint, plaintext.clone());
+        }
+        synchronized (directNotes) {
+            if (note == null || note.isBlank()) {
+                directNotes.remove(fingerprint);
+            } else {
+                directNotes.put(fingerprint, note);
+            }
+        }
+        if (previous != null && !Arrays.equals(previous, plaintext)) {
+            supersede(fingerprint);
+        }
+    }
+
+    /**
+     * Registers an editor to be told when a decode it may be showing has been replaced.
+     *
+     * <p>The registry is weak, so registering does not keep the editor alive and there is nothing to
+     * deregister — which matters because Burp never says when it has finished with one.
+     */
+    public void addUpdateListener(DecodeUpdateListener listener) {
+        if (listener == null) {
+            return;
+        }
+        synchronized (listeners) {
+            listeners.add(listener);
+        }
+    }
+
+    /**
+     * Drops the rendering built from a superseded reading of a body, and tells open editors.
+     *
+     * <p>Both halves are necessary and they fix different things. Dropping the {@link #results}
+     * entry matters because that cache is keyed by (session, direction, pragma) and never expires
+     * within a project: left in place it would serve the stale rendering for the life of the
+     * project, so not even closing and reopening the message would show the correction. The
+     * notification matters because the pane the user is looking at right now has already painted,
+     * and nothing else would ever ask it to paint again.
+     */
+    private void supersede(String fingerprint) {
+        ResultKey key;
+        synchronized (directRenderedAs) {
+            key = directRenderedAs.get(fingerprint);
+        }
+        if (key == null) {
+            // Nothing has rendered this body yet, so the new reading will be picked up on first
+            // display and there is nothing to invalidate.
+            return;
+        }
+        synchronized (results) {
+            results.remove(key);
+        }
+        List<DecodeUpdateListener> current;
+        synchronized (listeners) {
+            current = List.copyOf(listeners);
+        }
+        for (DecodeUpdateListener listener : current) {
+            try {
+                listener.decodeUpdated(key.sessionId(), key.direction(), key.pragma());
+            } catch (RuntimeException e) {
+                api.logging().logToError("Oracle Forms: a decode listener failed: " + e);
+            }
         }
     }
 
@@ -250,9 +364,22 @@ public final class DecodeService implements DecodedBodyCache {
         // and history has no record of it to replay from.
         Optional<byte[]> direct = get(rawBody);
         if (direct.isPresent()) {
+            // Remember which result this body produced, so a later, better reading of the same
+            // bytes can invalidate it rather than being computed into a cache nobody reads again.
+            String fingerprint = fingerprint(rawBody);
+            synchronized (directRenderedAs) {
+                directRenderedAs.put(fingerprint,
+                        new ResultKey(target.sessionId(), direction, target.pragma()));
+            }
+            String note;
+            synchronized (directNotes) {
+                note = directNotes.get(fingerprint);
+            }
+            String heading = label + " (sent from Burp"
+                    + (note == null || note.isBlank() ? "" : "; " + note) + ")";
             FhtPacket packet = parser.parse(direct.get(), new oracleforms.codec.StringDictionary());
             return new DecodeResult(
-                    FhtRenderer.render(packet, label + " (sent from Burp)", direct.get(),
+                    FhtRenderer.render(packet, heading, direct.get(),
                             new ReplayResult.FragmentGroup(
                                     target.pragma(), target.pragma(), target.pragma(), true)),
                     packet.outcome().isComplete());
@@ -356,6 +483,15 @@ public final class DecodeService implements DecodedBodyCache {
         }
         synchronized (directPlaintexts) {
             directPlaintexts.clear();
+        }
+        synchronized (directRenderedAs) {
+            directRenderedAs.clear();
+        }
+        synchronized (directNotes) {
+            directNotes.clear();
+        }
+        synchronized (listeners) {
+            listeners.clear();
         }
         checkpoints.clear();
     }

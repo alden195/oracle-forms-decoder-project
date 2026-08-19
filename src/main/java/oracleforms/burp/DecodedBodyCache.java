@@ -19,6 +19,20 @@ public interface DecodedBodyCache {
     /** Records the plaintext for a body, replacing any previous entry for the same bytes. */
     void put(byte[] ciphertext, byte[] plaintext);
 
+    /**
+     * As {@link #put}, with a caveat to show beside the decode.
+     *
+     * <p>Exists because a reading can be worth <em>showing</em> without being worth <em>believing</em>.
+     * The reply-offset search demands more before it will resynchronise a live session's ledger than
+     * before a decode is useful on screen, and the difference has to reach the user rather than being
+     * settled silently in favour of showing nothing.
+     *
+     * @param note appended to the decode's header line; null or blank for an unqualified decode
+     */
+    default void put(byte[] ciphertext, byte[] plaintext, String note) {
+        put(ciphertext, plaintext);
+    }
+
     /** The plaintext for a body, if it was decoded outside the replay path. */
     Optional<byte[]> get(byte[] ciphertext);
 }

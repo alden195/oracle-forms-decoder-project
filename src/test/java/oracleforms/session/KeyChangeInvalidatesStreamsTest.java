@@ -52,6 +52,7 @@ class KeyChangeInvalidatesStreamsTest {
 
     private static final class RecordingStore implements StreamPositionStore {
         private final Map<String, StreamPositions> saved = new HashMap<>();
+        private final Map<String, String> desyncs = new HashMap<>();
         private int forgets;
 
         @Override
@@ -67,7 +68,18 @@ class KeyChangeInvalidatesStreamsTest {
         @Override
         public void forgetPositions(String sessionId) {
             saved.remove(sessionId);
+            desyncs.remove(sessionId);
             forgets++;
+        }
+
+        @Override
+        public Optional<String> desyncReason(String sessionId) {
+            return Optional.ofNullable(desyncs.get(sessionId));
+        }
+
+        @Override
+        public void markDesynced(String sessionId, String reason) {
+            desyncs.put(sessionId, reason);
         }
     }
 

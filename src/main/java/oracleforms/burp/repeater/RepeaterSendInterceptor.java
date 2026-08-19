@@ -13,11 +13,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Executor;
 import java.util.function.Function;
 import oracleforms.burp.DecodedBodyCache;
 import oracleforms.burp.history.PragmaHistorySource;
 import oracleforms.session.CookieHeader;
 import oracleforms.session.InjectionPlan;
+import oracleforms.session.KeyValidation;
+import oracleforms.session.ReplyOffsetRecovery;
 import oracleforms.session.SessionId;
 import oracleforms.session.SessionKey;
 import oracleforms.session.SessionKeyStore;
@@ -25,6 +28,7 @@ import oracleforms.session.SessionStreams;
 import oracleforms.session.SessionTail;
 import oracleforms.session.StreamGapException;
 import oracleforms.session.StreamLeg;
+import oracleforms.session.StreamPositionUnknownException;
 import oracleforms.session.StreamRegistry;
 
 /**
@@ -63,11 +67,20 @@ public final class RepeaterSendInterceptor {
     /** Sends awaiting their reply. One small record each, dropped as soon as the reply lands. */
     private static final int MAX_PENDING = 64;
 
+    /**
+     * Below this, a reply is too short to judge as FHT or noise.
+     *
+     * <p>Steady-state Forms replies are 2 to 20 bytes and often carry no properties at all, so there
+     * is nothing in them to be right or wrong about.
+     */
+    private static final int MIN_JUDGEABLE_REPLY = 24;
+
     private final SessionKeyStore keyStore;
     private final StreamRegistry registry;
     private final Function<String, PragmaHistorySource> historyForSession;
     private final DecodedBodyCache decoded;
     private final Logging logging;
+    private final Executor background;
 
     private final Object[] locks = new Object[LOCK_STRIPES];
     private final Map<Integer, PendingSend> pending;
@@ -76,13 +89,34 @@ public final class RepeaterSendInterceptor {
     private record PendingSend(String sessionId, SendMode mode, long responseOffset, int pragma) {
     }
 
+    /**
+     * As the main constructor, running offset recovery on the calling thread.
+     *
+     * <p>For tests, which want the whole reply path to have finished by the time the call returns.
+     */
     public RepeaterSendInterceptor(
             SessionKeyStore keyStore,
             StreamRegistry registry,
             Function<String, PragmaHistorySource> historyForSession,
             DecodedBodyCache decoded,
             Logging logging) {
+        this(keyStore, registry, historyForSession, decoded, logging, Runnable::run);
+    }
 
+    /**
+     * @param background where to run offset recovery, which walks a quarter of a million candidate
+     *                   keystream positions and must not sit on the Burp response thread that
+     *                   delivered the reply (BApp criterion 5)
+     */
+    public RepeaterSendInterceptor(
+            SessionKeyStore keyStore,
+            StreamRegistry registry,
+            Function<String, PragmaHistorySource> historyForSession,
+            DecodedBodyCache decoded,
+            Logging logging,
+            Executor background) {
+
+        this.background = background;
         this.keyStore = keyStore;
         this.registry = registry;
         this.historyForSession = historyForSession;
@@ -229,7 +263,7 @@ public final class RepeaterSendInterceptor {
             SessionStreams streams;
             try {
                 streams = registry.open(markers.sessionId(), key, history);
-            } catch (StreamGapException e) {
+            } catch (StreamPositionUnknownException e) {
                 return Prepared.refused(e.getMessage() + "\n\nNothing was sent. Encrypting at a "
                         + "guessed offset would feed the server noise and could end the session you "
                         + "are testing, so the send is refused rather than attempted.");
@@ -334,15 +368,22 @@ public final class RepeaterSendInterceptor {
                 return Optional.of(ResponseReceivedAction.continueWith(response));
             }
 
-            byte[] plaintext;
+            Reply reply;
             synchronized (lockFor(sent.sessionId())) {
-                plaintext = decryptReply(sent, ciphertext);
+                reply = decryptReply(sent, ciphertext);
             }
-            if (plaintext != null) {
+            if (reply != null && reply.plaintext() != null) {
                 // Repeater responses never reach proxy history, so the replay path cannot find
                 // them. Keying the cache on the ciphertext lets the response editor pick this up
                 // without knowing anything about how it got here (architecture §6.5).
-                decoded.put(ciphertext, plaintext);
+                decoded.put(ciphertext, reply.plaintext());
+            }
+            // Scheduled only after the ledger's own attempt is cached, never before. The recovery
+            // overwrites that entry when it finds a better offset, so starting it first leaves a
+            // race in which the good plaintext is published and then immediately replaced by the
+            // unreadable one — permanently, since nothing runs a second time.
+            if (reply != null && reply.recovery() != null) {
+                background.execute(reply.recovery());
             }
         } catch (RuntimeException e) {
             logging.logToError("Oracle Forms: could not decrypt the reply to pragma "
@@ -351,24 +392,183 @@ public final class RepeaterSendInterceptor {
         return Optional.of(ResponseReceivedAction.continueWith(response));
     }
 
-    private byte[] decryptReply(PendingSend sent, byte[] ciphertext) {
+    /**
+     * The ledger's reading of a reply, and the search to run if it does not look like FHT.
+     *
+     * <p>The two are returned together rather than the search being launched here so the caller can
+     * publish the readable-or-not plaintext <em>first</em>. Ordering is the whole point: both write
+     * the same cache entry, and the recovery must be the one that wins.
+     */
+    private record Reply(byte[] plaintext, Runnable recovery) {
+    }
+
+    private Reply decryptReply(PendingSend sent, byte[] ciphertext) {
         if (sent.mode() == SendMode.TAIL) {
             Optional<SessionStreams> streams = registry.peek(sent.sessionId());
             if (streams.isEmpty()) {
                 return null;
             }
+            long at = streams.get().consumed(StreamLeg.SERVER_RESPONSE);
             byte[] plaintext = streams.get().apply(StreamLeg.SERVER_RESPONSE, ciphertext);
             registry.checkpoint(streams.get());
-            return plaintext;
+
+            if (readsAsFht(plaintext)) {
+                return new Reply(plaintext, null);
+            }
+            // Off the Burp thread that delivered this reply: the search walks a quarter of a
+            // million candidate offsets. The ledger's own attempt is cached in the meantime, so the
+            // response pane always has something; the recovery replaces it if it finds better.
+            return new Reply(plaintext, () -> recoverReply(sent, streams.get(), ciphertext, at));
         }
 
         // Offset mode never touched the ledger, so the reply is decrypted with a detached cipher at
         // the position the server would have been at when it sent the original.
         return keyStore.get(sent.sessionId())
-                .map(key -> SessionStreams.atOrigin(sent.sessionId(), key.key())
+                .map(key -> new Reply(SessionStreams.atOrigin(sent.sessionId(), key.key())
                         .cipherAtOffset(sent.responseOffset())
-                        .applied(ciphertext))
+                        .applied(ciphertext), null))
                 .orElse(null);
+    }
+
+    /**
+     * Whether a decrypted body looks like FHT rather than noise.
+     *
+     * <p>An empty or tiny reply is accepted without comment: the capture is full of 2-byte
+     * acknowledgements, and there is no structure in two bytes to judge. Demanding evidence from
+     * them would fire the recovery path on every routine send.
+     */
+    private static boolean readsAsFht(byte[] plaintext) {
+        if (plaintext == null || plaintext.length < MIN_JUDGEABLE_REPLY) {
+            return true;
+        }
+        KeyValidation.Signals signals = KeyValidation.signalsOf(plaintext);
+        return signals.properties() == 0 || KeyValidation.readsAsFht(signals);
+    }
+
+    /**
+     * Recovers a reply the ledger could not read, and resynchronises the ledger to what it finds.
+     *
+     * <p>This is the long-poll asymmetry described in {@link ReplyOffsetRecovery}: the response tail
+     * is measured from proxy history, which holds the client's outstanding request but not its
+     * response, so the reply to an injected message arrives one whole response further on than the
+     * ledger believes. The gap is not knowable when the message is sent, and it is not a race.
+     *
+     * <p>Resynchronising is safe here in a way guessing never is, because the offset was
+     * <em>verified</em> before it was believed — the body parses into property ids drawn from the id
+     * table. It is also the point: left uncorrected, the same gap would sit under the next send, and
+     * that one puts bytes on the wire.
+     *
+     * @param at the offset the ledger used, which the search starts from
+     */
+    private void recoverReply(
+            PendingSend sent, SessionStreams streams, byte[] ciphertext, long at) {
+
+        try {
+            Optional<SessionKey> key = keyStore.get(sent.sessionId());
+            if (key.isEmpty()) {
+                return;
+            }
+
+            ReplyOffsetRecovery.Scan scan;
+            Optional<ReplyOffsetRecovery.Found> found;
+            synchronized (lockFor(sent.sessionId())) {
+                scan = ReplyOffsetRecovery.scan(
+                        key.get().key(), ciphertext, at, ReplyOffsetRecovery.DEFAULT_WINDOW);
+                found = scan.accepted();
+                if (found.isPresent()) {
+                    // apply() already advanced the leg from `at` by this body's length. Adding the
+                    // gap puts it where the evidence says the body actually ended.
+                    streams.advance(StreamLeg.SERVER_RESPONSE, (int) found.get().gap());
+                    registry.checkpoint(streams);
+                }
+            }
+
+            if (found.isEmpty()) {
+                // Not good enough to move the ledger, which is the decision that would later put
+                // bytes on the wire. That says nothing about whether it is worth reading, so the
+                // best candidate is still shown if it clears the bar this class already uses to
+                // decide a reply decoded correctly -- see showUnverified.
+                boolean shown = showUnverified(sent, scan, ciphertext, key.get(), at);
+                logging.logToError("Oracle Forms: the reply to pragma " + sent.pragma()
+                        + " of session " + sent.sessionId() + " does not parse as FHT at keystream "
+                        + "offset " + at + ", and no offset within "
+                        + ReplyOffsetRecovery.DEFAULT_WINDOW + " bytes of it does either -- "
+                        + scan.describeRefusal() + ". "
+                        + (shown
+                                ? "The response pane is showing the best reading found, marked "
+                                        + "unverified. The ledger has NOT been resynchronised, so "
+                                        + "the next reply on this session will be off by the same "
+                                        + "amount."
+                                : "The response pane is showing the undecipherable version.")
+                        + " This session's response stream position should be treated as "
+                        + "unreliable; the request direction is unaffected.");
+                return;
+            }
+
+            ReplyOffsetRecovery.Found recovery = found.get();
+            decoded.put(ciphertext, SessionStreams.atOrigin(sent.sessionId(), key.get().key())
+                    .cipherAtOffset(recovery.offset())
+                    .applied(ciphertext));
+
+            logging.logToOutput("Oracle Forms: the reply to pragma " + sent.pragma()
+                    + " was encrypted at " + recovery.describe() + ". That gap is a response the "
+                    + "server flushed down the client's outstanding poll before answering us — its "
+                    + "length is not knowable when the message is sent, because proxy history holds "
+                    + "the client's request but not yet its reply. The response stream has been "
+                    + "resynchronised, and the response pane now shows the decoded message.");
+        } catch (RuntimeException e) {
+            logging.logToError("Oracle Forms: reply offset recovery failed: " + e);
+        }
+    }
+
+    /**
+     * Shows the best offset the search found, without believing it.
+     *
+     * <h2>Why the two decisions are not the same decision</h2>
+     *
+     * <p>Accepting an offset does two things: it decides what to display, and it moves the session's
+     * response ledger. Only the second is dangerous — a wrong ledger sits under the next send and
+     * puts bytes on a live application's wire — and it is the reason
+     * {@link ReplyOffsetRecovery#search} demands a parse that reaches the terminator. Displaying is
+     * not dangerous at all, and refusing to display leaves the user staring at bytes that are
+     * definitely wrong instead of bytes that are probably right.
+     *
+     * <p>Tying them together produced an incoherent result against the live target on 2026-08-18: a
+     * candidate with <em>4 of 4</em> property ids known was withheld, while the pane went on showing
+     * a reading with 2 of 9 — even though {@link #readsAsFht}, this class's own test for "that
+     * decoded correctly", would have passed the first and did reject the second. The bar for showing
+     * is therefore exactly that same test, so the two can no longer disagree.
+     *
+     * <p>The ledger is deliberately left alone, and the log says so: an unverified offset is worth
+     * reading and not worth building on.
+     *
+     * @return whether anything was shown
+     */
+    private boolean showUnverified(
+            PendingSend sent,
+            ReplyOffsetRecovery.Scan scan,
+            byte[] ciphertext,
+            SessionKey key,
+            long ledgerOffset) {
+
+        Optional<ReplyOffsetRecovery.Found> closest = scan.closest();
+        if (closest.isEmpty()) {
+            return false;
+        }
+        ReplyOffsetRecovery.Found candidate = closest.get();
+        byte[] plaintext = SessionStreams.atOrigin(sent.sessionId(), key.key())
+                .cipherAtOffset(candidate.offset())
+                .applied(ciphertext);
+        if (!readsAsFht(plaintext)) {
+            return false;
+        }
+
+        decoded.put(ciphertext, plaintext,
+                "keystream offset " + candidate.offset() + " recovered but UNVERIFIED, "
+                        + candidate.gap() + " bytes past the ledger's " + ledgerOffset
+                        + " -- the parse did not reach a terminator, so the stream was not "
+                        + "resynchronised");
+        return true;
     }
 
     private void remember(int messageId, PendingSend sent) {

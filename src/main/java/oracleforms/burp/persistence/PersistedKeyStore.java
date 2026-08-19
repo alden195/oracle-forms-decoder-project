@@ -36,20 +36,29 @@ import oracleforms.session.StreamPositions;
  *   │           ├── lastSeen   Long
  *   │           ├── label      String
  *   │           └── source     String
- *   └── streams
- *         └── &lt;jsessionid&gt;          only once the session's four legs diverge
- *               ├── clientRequestBytes   Long
- *               ├── serverRequestBytes   Long
- *               ├── serverResponseBytes  Long
- *               ├── clientResponseBytes  Long
- *               ├── nextPragma           Long
- *               └── keyFingerprint       Long
+ *   ├── streams
+ *   │     └── &lt;jsessionid&gt;          only once the session's four legs diverge
+ *   │           ├── clientRequestBytes   Long
+ *   │           ├── serverRequestBytes   Long
+ *   │           ├── serverResponseBytes  Long
+ *   │           ├── clientResponseBytes  Long
+ *   │           ├── nextPragma           Long
+ *   │           └── keyFingerprint       Long
+ *   └── desync
+ *         └── &lt;jsessionid&gt;          only once the session's position becomes unrecoverable
+ *               └── reason           String
  * </pre>
  *
  * <p>The stream counters are a <em>sibling</em> of the session entry rather than a child of it, which
  * deviates from the tree drawn in architecture &sect;3. The reason is {@link #put}: it replaces a
  * session's entry wholesale, so anything nested inside would be silently destroyed every time a key
  * was re-derived. Keeping them apart makes that impossible rather than merely avoided.
+ *
+ * <p><b>{@code desync} is a third sibling for exactly the same reason, one level down.</b>
+ * {@link #save} replaces a session's <em>stream</em> entry wholesale, so a desync marker nested
+ * inside it would be destroyed by the next checkpoint — and the two are independent anyway: a session
+ * can be desynchronised without ever having diverged, which is the common case (architecture
+ * &sect;6.11).
  *
  * <p>Every read is defensive. The project file is user-editable state that may have been written by
  * an older version of this extension, so a malformed entry is logged and skipped rather than being
@@ -60,6 +69,8 @@ public final class PersistedKeyStore implements SessionKeyStore, StreamPositionS
     private static final String ROOT = "oracleForms";
     private static final String SESSIONS = "sessions";
     private static final String STREAMS = "streams";
+    private static final String DESYNC = "desync";
+    private static final String REASON = "reason";
 
     private static final String KEY = "key";
     private static final String HOST = "host";
@@ -161,6 +172,7 @@ public final class PersistedKeyStore implements SessionKeyStore, StreamPositionS
         if (root != null) {
             root.deleteChildObject(SESSIONS);
             root.deleteChildObject(STREAMS);
+            root.deleteChildObject(DESYNC);
         }
     }
 
@@ -233,15 +245,75 @@ public final class PersistedKeyStore implements SessionKeyStore, StreamPositionS
         }
     }
 
+    /**
+     * Why this session can no longer be appended to, or empty if it still can.
+     *
+     * <p>Unlike every other read here, an unreadable record is <strong>not</strong> treated as
+     * absent. A marker that exists but cannot be parsed still proves that something was once marked,
+     * and the safe reading of "I know this session was broken but not why" is to keep refusing.
+     * Everywhere else in this class a corrupt entry costs a rebuild; here it would cost a live
+     * application session.
+     */
+    @Override
+    public synchronized Optional<String> desyncReason(String sessionId) {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return Optional.empty();
+        }
+        PersistedObject desync = collection(DESYNC, false);
+        if (desync == null) {
+            return Optional.empty();
+        }
+        PersistedObject entry = desync.getChildObject(sessionId);
+        if (entry == null) {
+            return Optional.empty();
+        }
+        try {
+            String reason = entry.getString(REASON);
+            return Optional.of(reason == null || reason.isBlank()
+                    ? "This session was marked as desynchronised, but no reason was recorded."
+                    : reason);
+        } catch (RuntimeException e) {
+            logging.logToError("Could not read the desync reason for session " + sessionId
+                    + "; continuing to refuse sends for it: " + e);
+            return Optional.of("This session was marked as desynchronised, but the reason could "
+                    + "not be read back from the project file.");
+        }
+    }
+
+    @Override
+    public synchronized void markDesynced(String sessionId, String reason) {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        try {
+            PersistedObject entry = PersistedObject.persistedObject();
+            entry.setString(REASON, reason == null ? "" : reason);
+            collection(DESYNC, true).setChildObject(sessionId, entry);
+        } catch (RuntimeException e) {
+            // Losing this costs the refusal on the next reload, not now: StreamRegistry holds the
+            // same fact in memory for the life of the extension. Worth saying out loud, because the
+            // session silently becomes sendable again after a restart.
+            logging.logToError("Could not persist the desync marker for session " + sessionId
+                    + "; sends will be refused until the extension is reloaded, but not after: " + e);
+        }
+    }
+
     @Override
     public synchronized void forgetPositions(String sessionId) {
         forget0(sessionId);
     }
 
     private void forget0(String sessionId) {
-        PersistedObject streams = streams(false);
-        if (streams != null && sessionId != null && streams.getChildObject(sessionId) != null) {
-            streams.deleteChildObject(sessionId);
+        if (sessionId == null) {
+            return;
+        }
+        deleteFrom(streams(false), sessionId);
+        deleteFrom(collection(DESYNC, false), sessionId);
+    }
+
+    private static void deleteFrom(PersistedObject collection, String sessionId) {
+        if (collection != null && collection.getChildObject(sessionId) != null) {
+            collection.deleteChildObject(sessionId);
         }
     }
 

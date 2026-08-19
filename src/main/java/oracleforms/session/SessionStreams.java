@@ -153,12 +153,111 @@ public final class SessionStreams {
     }
 
     /**
+     * What the proxy should put on the wire for a message it is forwarding.
+     *
+     * @param body      the bytes to forward
+     * @param rewritten whether they differ from what arrived, so the caller can skip rebuilding the
+     *                  message when they do not
+     */
+    public record Forwarded(byte[] body, boolean rewritten) {
+    }
+
+    /**
+     * Carries one proxied message across the two cipher relationships, and reports what to send on.
+     *
+     * <p><strong>This is the half of the four-stream model that touches bytes,</strong> and leaving
+     * it out is why the first live-target send failed. {@link #observeUnmodified} keeps the counters
+     * honest but forwards the original ciphertext, which is correct only while the two legs of a
+     * direction sit at the same offset. After an injection they do not: the client encrypts at
+     * <i>T</i> while the server decrypts at <i>T + n</i>, so the client's very next message reaches
+     * the Forms runtime as noise and it answers {@code FRM-93618} (architecture &sect;6.11).
+     *
+     * <p>So once a direction has diverged, the message is decrypted on the leg facing whoever sent it
+     * and re-encrypted on the leg facing whoever receives it. Both sides then read exactly what the
+     * other wrote, at the offset each believes it is at, and neither can tell (&sect;6.2).
+     *
+     * <p>Both legs move together under this object's lock, because a message that advanced one and
+     * not the other would leave the ledger describing a session that never existed.
+     *
+     * <p>Undiverged sessions take the cheap path deliberately: the two legs share a keystream
+     * position, so translating would hand back the input after two RC4 passes. That keeps the cost on
+     * the proxy hot path at four counter updates for every session nobody has ever sent into.
+     */
+    public synchronized Forwarded forward(Direction direction, byte[] body, int pragma) {
+        notePragma(pragma);
+        if (body == null || body.length == 0) {
+            return new Forwarded(body == null ? new byte[0] : body, false);
+        }
+        // Written straight to the socket by the client without passing through its cipher, so there
+        // is nothing to translate and nothing to advance — in either direction of divergence.
+        if (direction == Direction.REQUEST && PragmaBody.isNullPost(body)) {
+            return new Forwarded(body, false);
+        }
+
+        StreamLeg inbound = direction == Direction.REQUEST
+                ? StreamLeg.CLIENT_REQUEST : StreamLeg.SERVER_RESPONSE;
+        StreamLeg outbound = inbound.peer();
+
+        if (consumed.get(inbound).equals(consumed.get(outbound))) {
+            advance(inbound, body.length);
+            advance(outbound, body.length);
+            return new Forwarded(body, false);
+        }
+
+        byte[] plaintext = ciphers.get(inbound).applied(body);
+        consumed.merge(inbound, (long) body.length, Long::sum);
+        byte[] reencrypted = ciphers.get(outbound).applied(plaintext);
+        consumed.merge(outbound, (long) body.length, Long::sum);
+        return new Forwarded(reencrypted, true);
+    }
+
+    /**
+     * Carries an <em>edited</em> proxied request across the two cipher relationships.
+     *
+     * <p>This is architecture &sect;6.2's {@code "proxied request P, edited to P′"} row, and Mode D
+     * (&sect;6.12) is the only thing that ever performs it. The client's leg advances by the length
+     * the client actually put on the wire; the server's leg advances by the length of what we send
+     * instead. Between them they are the divergence, and after this call every later message in the
+     * session goes through {@link #forward}, which is already built for it.
+     *
+     * <p>Both legs move under this object's lock, in one call, because a caller that advanced one and
+     * then failed before the other would leave the ledger describing a session that never existed —
+     * and unlike {@link InjectionPlan#atTail} there is no external per-session lock on the proxy path
+     * to lean on.
+     *
+     * <p>Two rules come for free from the methods this delegates to, and both matter. A
+     * {@code NULLPOST} the user has edited <em>into</em> the message is written cleartext and
+     * advances the server's leg by nothing, because {@link #apply} enforces that; and a same-length
+     * edit leaves the two legs equal, so nothing diverges and later traffic keeps forwarding
+     * unchanged.
+     *
+     * @param editedPlaintext      what the user wants sent, still in the clear
+     * @param originalStreamLength how many bytes the client's own message contributed to its
+     *                             keystream — its ciphertext length, or zero for a {@code NULLPOST}
+     * @return the ciphertext to put on the wire
+     */
+    public synchronized byte[] editInFlight(
+            byte[] editedPlaintext, int originalStreamLength, int pragma) {
+        notePragma(pragma);
+        // The client's cipher has moved on by what the client wrote, whatever we send in its place.
+        advance(StreamLeg.CLIENT_REQUEST, originalStreamLength);
+        return apply(StreamLeg.SERVER_REQUEST, editedPlaintext);
+    }
+
+    /** Whether the two legs of one direction have parted company. */
+    public synchronized boolean diverged(Direction direction) {
+        StreamLeg leg = direction == Direction.REQUEST
+                ? StreamLeg.CLIENT_REQUEST : StreamLeg.SERVER_RESPONSE;
+        return !consumed.get(leg).equals(consumed.get(leg.peer()));
+    }
+
+    /**
      * Records a message that passed through unchanged, advancing both legs of its direction.
      *
-     * <p>This is the ordinary case — the client says something, Burp forwards it verbatim — and it
-     * has to be tracked or the ledger goes stale the moment the live client sends anything after the
-     * session was opened. Advancing both legs by the same amount preserves whatever divergence an
-     * earlier edit or injection created.
+     * <p>Correct only while the direction has not diverged; {@link #forward} is what a proxy should
+     * call, and it falls back to this when the legs still agree. Kept separate because "the counters
+     * moved" and "these are the bytes to send" are different questions, and a caller that only has
+     * the first — replaying a capture, rebuilding a ledger — should not be handed a cipher.
      *
      * <p>The {@code NULLPOST} rule applies here too: the sentinel never entered the cipher, so it
      * moves nothing.

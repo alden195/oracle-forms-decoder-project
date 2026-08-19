@@ -25,7 +25,7 @@ import oracleforms.session.Direction;
  * discards results that land after the user has already moved to another message — without it, a
  * slow decode of a large Pragma 3 response would overwrite whatever the user is looking at now.
  */
-final class FormsEditorPane {
+final class FormsEditorPane implements DecodeService.DecodeUpdateListener {
 
     private final MontoyaApi api;
     private final DecodeService decodeService;
@@ -35,12 +35,40 @@ final class FormsEditorPane {
     /** Incremented on every message shown; stale results are dropped. */
     private final AtomicLong generation = new AtomicLong();
 
+    /** What this pane is currently displaying, so a superseded decode can be recognised. */
+    private volatile FormsDetector.FormsTarget shown;
+    private volatile byte[] shownBody;
+
     FormsEditorPane(MontoyaApi api, DecodeService decodeService, Direction direction) {
         this.api = api;
         this.decodeService = decodeService;
         this.direction = direction;
         this.editor = api.userInterface().createRawEditor(
                 EditorOptions.READ_ONLY, EditorOptions.WRAP_LINES);
+        // Held weakly by the service, so this does not have to be undone when Burp discards the
+        // editor -- and Burp never says when it has.
+        decodeService.addUpdateListener(this);
+    }
+
+    /**
+     * Repaints when the bytes behind the displayed message have been decoded again, better.
+     *
+     * <p>The reply to a Repeater send is first read at the ledger's keystream offset and only
+     * afterwards at the offset {@code ReplyOffsetRecovery} solves for, which takes seconds. Without
+     * this the corrected reading lands in a cache while the pane keeps showing the noise it painted
+     * first, and the whole recovery is invisible.
+     */
+    @Override
+    public void decodeUpdated(String sessionId, Direction updated, int pragma) {
+        FormsDetector.FormsTarget target = shown;
+        byte[] body = shownBody;
+        if (target == null || body == null
+                || updated != direction
+                || target.pragma() != pragma
+                || !target.sessionId().equals(sessionId)) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> show(target, body));
     }
 
     Component uiComponent() {
@@ -54,6 +82,8 @@ final class FormsEditorPane {
     /** Shows a message: pending state now, decoded text when the background work finishes. */
     void show(FormsDetector.FormsTarget target, byte[] body) {
         long mine = generation.incrementAndGet();
+        this.shown = target;
+        this.shownBody = body;
 
         setText("Decoding pragma " + target.pragma() + " of session " + target.sessionId() + "...\n\n"
                 + "Replaying the RC4 stream from the start of the session.");
@@ -73,6 +103,8 @@ final class FormsEditorPane {
     /** Shows a message that could not even be identified as Forms traffic. */
     void showNotApplicable(String reason) {
         generation.incrementAndGet();
+        this.shown = null;
+        this.shownBody = null;
         setText(reason);
     }
 

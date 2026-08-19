@@ -2,6 +2,7 @@ package oracleforms.burp.repeater;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import burp.api.montoya.http.message.requests.HttpRequest;
@@ -227,5 +228,115 @@ class DraftMarkersTest {
                 "mode B is designed but not built; it must not parse as something else");
         assertTrue(SendMode.TAIL.touchesLiveSession());
         assertFalse(SendMode.OFFSET.touchesLiveSession());
+    }
+
+    // ---- Mode D: the intercept markers (architecture §6.12) --------------------------------
+
+    @Test
+    @DisplayName("an intercept draft carries its original length and its token")
+    void interceptMarkersRoundTrip() {
+        HttpRequest request = FakeRequest.with(
+                DraftMarkers.SESSION_HEADER, "abc",
+                DraftMarkers.SEND_HEADER, "intercept",
+                DraftMarkers.ORIGIN_HEADER, "42",
+                DraftMarkers.ORIGINAL_HEADER, "137",
+                DraftMarkers.TOKEN_HEADER, "deadbeefdeadbeefdeadbeefdeadbeef");
+
+        DraftMarkers markers = DraftMarkers.from(request).orElseThrow();
+        assertEquals(SendMode.INTERCEPT, markers.mode());
+        assertEquals(137, markers.originalLength());
+        assertEquals("deadbeefdeadbeefdeadbeefdeadbeef", markers.token());
+    }
+
+    @Test
+    @DisplayName("an intercept draft without an original length is not a draft at all")
+    void interceptWithoutALengthIsNotADraft() {
+        // Guessing it would advance the client's keystream leg by the wrong amount and
+        // desynchronise the session permanently, so there is no safe default to fall back to.
+        assertTrue(DraftMarkers.from(FakeRequest.with(
+                DraftMarkers.SESSION_HEADER, "abc",
+                DraftMarkers.SEND_HEADER, "intercept",
+                DraftMarkers.TOKEN_HEADER, "deadbeefdeadbeefdeadbeefdeadbeef")).isEmpty());
+
+        assertTrue(DraftMarkers.from(FakeRequest.with(
+                DraftMarkers.SESSION_HEADER, "abc",
+                DraftMarkers.SEND_HEADER, "intercept",
+                DraftMarkers.ORIGINAL_HEADER, "not a number",
+                DraftMarkers.TOKEN_HEADER, "deadbeefdeadbeefdeadbeefdeadbeef")).isEmpty());
+    }
+
+    @Test
+    @DisplayName("a missing token is parsed, not defaulted: the handler decides, not the parser")
+    void aMissingTokenParsesAsNull() {
+        DraftMarkers markers = DraftMarkers.from(FakeRequest.with(
+                DraftMarkers.SESSION_HEADER, "abc",
+                DraftMarkers.SEND_HEADER, "intercept",
+                DraftMarkers.ORIGINAL_HEADER, "12")).orElseThrow();
+
+        assertNull(markers.token(),
+                "parsing must not decide trust; that belongs to the one place that can consume it");
+    }
+
+    @Test
+    @DisplayName("the intercept markers come off with the rest")
+    void interceptMarkersAreStripped() {
+        HttpRequest request = FakeRequest.with(
+                DraftMarkers.SESSION_HEADER, "abc",
+                DraftMarkers.SEND_HEADER, "intercept",
+                DraftMarkers.ORIGINAL_HEADER, "12",
+                DraftMarkers.TOKEN_HEADER, "deadbeefdeadbeefdeadbeefdeadbeef",
+                "Pragma", "9");
+
+        HttpRequest stripped = DraftMarkers.strip(request);
+        assertFalse(stripped.hasHeader(DraftMarkers.ORIGINAL_HEADER));
+        assertFalse(stripped.hasHeader(DraftMarkers.TOKEN_HEADER));
+        assertTrue(stripped.hasHeader("Pragma"), "the message's own headers must survive");
+    }
+
+    @Test
+    @DisplayName("only Mode D emits the token, so no other tab holds a spendable capability")
+    void onlyInterceptEmitsTheToken() {
+        HttpRequest plain = FakeRequest.with("Pragma", "9");
+
+        HttpRequest tail = new DraftMarkers("abc", SendMode.TAIL, 9, 0, "sometoken", 5L).applyTo(plain);
+        assertFalse(tail.hasHeader(DraftMarkers.TOKEN_HEADER));
+        assertFalse(tail.hasHeader(DraftMarkers.ORIGINAL_HEADER));
+
+        HttpRequest intercept =
+                new DraftMarkers("abc", SendMode.INTERCEPT, 9, 55, "sometoken", 77L).applyTo(plain);
+        assertEquals("55", intercept.headerValue(DraftMarkers.ORIGINAL_HEADER));
+        assertEquals("sometoken", intercept.headerValue(DraftMarkers.TOKEN_HEADER));
+    }
+
+    @Test
+    @DisplayName("the decoded-at position round-trips, so Forward can check the ledger has not moved")
+    void positionRoundTrips() {
+        HttpRequest marked = new DraftMarkers("abc", SendMode.INTERCEPT, 9, 55, "tok", 280323L)
+                .applyTo(FakeRequest.with("Pragma", "9"));
+
+        assertEquals("280323", marked.headerValue(DraftMarkers.POSITION_HEADER));
+        assertEquals(280323L, DraftMarkers.from(marked).orElseThrow().expectedPosition());
+    }
+
+    @Test
+    @DisplayName("an unstated position parses as -1, which the handler reads as 'do not check'")
+    void anUnstatedPositionIsNotZero() {
+        DraftMarkers markers = DraftMarkers.from(FakeRequest.with(
+                DraftMarkers.SESSION_HEADER, "abc",
+                DraftMarkers.SEND_HEADER, "intercept",
+                DraftMarkers.ORIGINAL_HEADER, "12")).orElseThrow();
+
+        // Zero is a real keystream offset -- the very first encrypted message sits at it -- so an
+        // absent header must not be read as one.
+        assertEquals(-1L, markers.expectedPosition());
+    }
+
+    @Test
+    @DisplayName("the position marker comes off with the rest")
+    void positionIsStripped() {
+        HttpRequest marked = new DraftMarkers("abc", SendMode.INTERCEPT, 9, 55, "tok", 1L)
+                .applyTo(FakeRequest.with("Pragma", "9"));
+
+        assertFalse(DraftMarkers.strip(marked).hasHeader(DraftMarkers.POSITION_HEADER));
     }
 }

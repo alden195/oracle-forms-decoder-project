@@ -226,4 +226,74 @@ class KeyValidationTest {
         assertTrue(KeyValidation.crossCheck(parsed.stream()
                 .map(KeyValidationTest::validate).toList()).validated());
     }
+
+    // ---- reading a decode as FHT -------------------------------------------------------------
+
+    /**
+     * The real message that exposed the bar, reconstructed byte for byte from a live edit
+     * (2026-08-19): a text item's value, its selection and its caret, then the focus move.
+     *
+     * <p>Its text property is id 99, which the ported table has no name for — so a perfectly
+     * decoded message from the target scores four names out of five.
+     */
+    private static byte[] liveTextItemUpdate() {
+        return new oracleforms.codec.TestPackets()
+                .message(0x1000, 0, 113)
+                .stringProperty(99, 0, "elevenchars")
+                .point8Property(195, 11, 11)
+                .uint8Property(193, 11)
+                .endProperties()
+                .message(0x1000, 0, 113)
+                .boolProperty(174, false)
+                .endProperties()
+                .message(0x1000, 0, 96)
+                .boolProperty(174, true)
+                .endProperties()
+                .endPacket()
+                .build();
+    }
+
+    @Test
+    @DisplayName("a real message with an id the table has no name for still reads as FHT")
+    void anIncompleteIdTableDoesNotCondemnACorrectDecode() {
+        KeyValidation.Signals signals = KeyValidation.signalsOf(liveTextItemUpdate());
+
+        assertEquals(5, signals.properties());
+        assertEquals(4, signals.knownProperties());
+        assertTrue(signals.complete());
+        assertTrue(signals.knownFraction() < KeyValidation.MIN_KNOWN_FRACTION,
+                "0.8: the bar this message used to be refused by");
+        assertTrue(KeyValidation.readsAsFht(signals),
+                "it parses from the first byte to a terminator; the table's gaps are not its fault");
+    }
+
+    @Test
+    @DisplayName("noise does not read as FHT, whichever signal it leans on")
+    void noiseIsStillRejected() {
+        byte[] plaintext = liveTextItemUpdate();
+        // The wrong-offset failure this check exists to catch: the right bytes, the wrong keystream.
+        byte[] noise = plaintext.clone();
+        new Rc4Stream(new byte[] {1, 2, 3, 4, 5}).apply(noise);
+
+        assertFalse(KeyValidation.readsAsFht(KeyValidation.signalsOf(noise)));
+    }
+
+    @Test
+    @DisplayName("a complete parse alone is not enough")
+    void aCleanParseWithUnknownIdsIsNotEnough() {
+        byte[] unrecognisable = new oracleforms.codec.TestPackets()
+                .message(0x1000, 0, 113)
+                .int32Property(0x7A1, 1)
+                .int32Property(0x7A2, 2)
+                .int32Property(0x7A3, 3)
+                .int32Property(0x7A4, 4)
+                .endProperties()
+                .endPacket()
+                .build();
+
+        KeyValidation.Signals signals = KeyValidation.signalsOf(unrecognisable);
+        assertTrue(signals.complete());
+        assertEquals(0, signals.knownProperties());
+        assertFalse(KeyValidation.readsAsFht(signals));
+    }
 }

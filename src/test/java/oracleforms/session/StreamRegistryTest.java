@@ -152,6 +152,81 @@ class StreamRegistryTest {
         assertEquals(250, tail.responseBytes());
     }
 
+    // ---- the position before a message ------------------------------------------------------
+
+    /**
+     * The measurement an in-flight edit needs, and the one whose absence broke Mode D.
+     *
+     * <p>Burp puts a request into the proxy history when it <em>intercepts</em> it, so the message
+     * held in the Intercept tab is in the capture already while the server has never seen it. A tail
+     * counts it; the position before it does not, and that difference is a whole message's worth of
+     * keystream.
+     */
+    @Test
+    @DisplayName("the position before a message excludes that message")
+    void positionBeforeAMessageExcludesIt() throws Exception {
+        PragmaSource source = contiguous(12, 10, 100);
+
+        SessionTail tail = SessionTail.measure(source);
+        SessionTail before = SessionTail.before(source, 12);
+
+        assertEquals(100, tail.requestBytes(), "pragmas 3..12 is ten messages");
+        assertEquals(90, before.requestBytes(), "pragmas 3..11 is nine");
+        assertEquals(12, before.nextPragma(),
+                "the message about to go out is the one the ledger should be expecting");
+    }
+
+    @Test
+    @DisplayName("a hole before the message is still refused")
+    void positionBeforeStillRefusesAGap() {
+        Map<Integer, Integer> requests = new LinkedHashMap<>();
+        Map<Integer, Integer> responses = new LinkedHashMap<>();
+        for (int pragma = 3; pragma <= 12; pragma++) {
+            if (pragma != 7) {
+                requests.put(pragma, 10);
+            }
+            responses.put(pragma, 50);
+        }
+
+        StreamGapException gap = assertThrows(StreamGapException.class,
+                () -> SessionTail.before(source(requests, responses), 12));
+        assertEquals(7, gap.missing());
+    }
+
+    @Test
+    @DisplayName("openBefore positions both request legs before the held message")
+    void openBeforePositionsTheLedgerBeforeTheMessage() throws Exception {
+        StreamRegistry registry = new StreamRegistry(null);
+
+        SessionStreams streams = registry.openBefore(SESSION, key(), contiguous(12, 10, 100), 12);
+
+        assertEquals(90, streams.consumed(StreamLeg.CLIENT_REQUEST));
+        assertEquals(90, streams.consumed(StreamLeg.SERVER_REQUEST));
+        assertFalse(streams.diverged());
+    }
+
+    @Test
+    @DisplayName("a verified correction replaces the ledger; a diverged session keeps its counters")
+    void resynchroniseRefusesADivergedSession() throws Exception {
+        StreamRegistry registry = new StreamRegistry(null);
+        PragmaSource source = contiguous(12, 10, 100);
+
+        SessionStreams open = registry.open(SESSION, key(), source);
+        SessionStreams corrected = registry.measureBefore(SESSION, key(), source, 12);
+        assertEquals(100, open.consumed(StreamLeg.CLIENT_REQUEST));
+        assertEquals(90, corrected.consumed(StreamLeg.CLIENT_REQUEST));
+
+        assertTrue(registry.resynchronise(corrected));
+        assertSame(corrected, registry.peek(SESSION).orElseThrow());
+
+        // Once the extension has injected something, history no longer describes the server's leg,
+        // so a measurement of it cannot be allowed to overwrite the only record there is.
+        corrected.advance(StreamLeg.SERVER_REQUEST, 40);
+        assertFalse(registry.resynchronise(
+                registry.measureBefore(SESSION, key(), source, 12)));
+        assertSame(corrected, registry.peek(SESSION).orElseThrow());
+    }
+
     // ---- the registry ---------------------------------------------------------------------
 
     @Test
@@ -253,6 +328,7 @@ class StreamRegistryTest {
     }
 
     private static StreamPositionStore recordingStore(Map<String, StreamPositions> backing) {
+        Map<String, String> desyncs = new HashMap<>();
         return new StreamPositionStore() {
             @Override
             public Optional<StreamPositions> load(String sessionId) {
@@ -268,6 +344,17 @@ class StreamRegistryTest {
             @Override
             public void forgetPositions(String sessionId) {
                 backing.remove(sessionId);
+                desyncs.remove(sessionId);
+            }
+
+            @Override
+            public Optional<String> desyncReason(String sessionId) {
+                return Optional.ofNullable(desyncs.get(sessionId));
+            }
+
+            @Override
+            public void markDesynced(String sessionId, String reason) {
+                desyncs.put(sessionId, reason);
             }
         };
     }

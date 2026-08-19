@@ -52,6 +52,27 @@ public record SessionTail(
         return measure(source, source.highestPragma());
     }
 
+    /**
+     * Where the session's streams stood immediately <em>before</em> {@code pragma}.
+     *
+     * <p>A different question from {@link #measure(PragmaSource)}, and the difference is what broke
+     * Mode D: <strong>Burp records a request in the proxy history as soon as it intercepts it, not
+     * when it forwards it.</strong> So while a request is held in the Intercept tab it is already in
+     * history, indistinguishable from one the server has read — and the tail, which means "what the
+     * server's cipher has consumed", counted bytes that had not been sent. An in-flight edit
+     * decrypted at that position is one whole message too far along the keystream.
+     *
+     * <p>Bounding the scan at {@code pragma - 1} is exact rather than cautious: the message at
+     * {@code pragma} is the one being held, so by construction neither it nor anything after it has
+     * reached the server. It also leaves {@link #nextPragma()} equal to {@code pragma}, which is the
+     * number the message about to go out actually carries.
+     *
+     * @throws StreamGapException if the traffic before {@code pragma} has a hole in it
+     */
+    public static SessionTail before(PragmaSource source, int pragma) throws StreamGapException {
+        return measure(source, pragma - 1);
+    }
+
     private record Leg(int lastPragma, long bytes) {
     }
 

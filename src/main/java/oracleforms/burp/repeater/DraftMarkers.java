@@ -22,19 +22,43 @@ import java.util.Optional;
  *       would put readable FHT — and any credentials in it — on the wire.
  * </ol>
  *
- * @param sessionId    the {@code JSESSIONID} whose key and streams to encrypt with
- * @param mode         how to choose the keystream offset
- * @param originPragma the pragma the draft was taken from, for provenance and for
- *                     {@link SendMode#OFFSET}
+ * <p>{@link SendMode#INTERCEPT} adds two more (architecture &sect;6.12). {@code originalLength}
+ * carries what the client's own message contributed to its request keystream, which only the editor
+ * knows by the time the handler sees the edited body; {@code token} is the single-use capability
+ * that makes a marker arriving <em>from the Proxy</em> trustworthy without weakening rule 1 above.
+ *
+ * @param sessionId      the {@code JSESSIONID} whose key and streams to encrypt with
+ * @param mode           how to choose the keystream offset
+ * @param originPragma   the pragma the draft was taken from, for provenance and for
+ *                       {@link SendMode#OFFSET}
+ * @param originalLength {@link SendMode#INTERCEPT} only: the client's own body length in bytes
+ * @param token          {@link SendMode#INTERCEPT} only: the capability, or null for every other
+ *                       mode, which is trusted by tool origin instead
+ * @param expectedPosition {@link SendMode#INTERCEPT} only: where the client's keystream leg stood
+ *                       when the message was decoded, or -1 if not stated. Checked again at Forward,
+ *                       because a ledger that moved in between means the decode this edit was made
+ *                       against no longer describes the session
  */
-public record DraftMarkers(String sessionId, SendMode mode, int originPragma) {
+public record DraftMarkers(
+        String sessionId, SendMode mode, int originPragma, int originalLength, String token,
+        long expectedPosition) {
 
     public static final String SESSION_HEADER = "X-OracleForms-Session";
     public static final String SEND_HEADER = "X-OracleForms-Send";
     public static final String ORIGIN_HEADER = "X-OracleForms-Origin";
 
-    private static final List<String> ALL_HEADERS =
-            List.of(SESSION_HEADER, SEND_HEADER, ORIGIN_HEADER);
+    /** Mode D: the client's own body length, so its keystream leg can be advanced past it. */
+    public static final String ORIGINAL_HEADER = "X-OracleForms-Original";
+
+    /** Mode D: the single-use capability that authorises a Proxy-originated marker. */
+    public static final String TOKEN_HEADER = "X-OracleForms-Token";
+
+    /** Mode D: the client-leg keystream offset the edit was decoded against. */
+    public static final String POSITION_HEADER = "X-OracleForms-Position";
+
+    private static final List<String> ALL_HEADERS = List.of(
+            SESSION_HEADER, SEND_HEADER, ORIGIN_HEADER, ORIGINAL_HEADER, TOKEN_HEADER,
+            POSITION_HEADER);
 
     public DraftMarkers {
         if (sessionId == null || sessionId.isEmpty()) {
@@ -43,6 +67,15 @@ public record DraftMarkers(String sessionId, SendMode mode, int originPragma) {
         if (mode == null) {
             throw new IllegalArgumentException("mode must not be null");
         }
+        if (originalLength < 0) {
+            throw new IllegalArgumentException("originalLength must not be negative");
+        }
+        token = token == null || token.isBlank() ? null : token.trim();
+    }
+
+    /** The three-marker form every mode except {@link SendMode#INTERCEPT} uses. */
+    public DraftMarkers(String sessionId, SendMode mode, int originPragma) {
+        this(sessionId, mode, originPragma, 0, null, -1);
     }
 
     /**
@@ -61,16 +94,42 @@ public record DraftMarkers(String sessionId, SendMode mode, int originPragma) {
         if (mode.isEmpty()) {
             return Optional.empty();
         }
-        int origin = 0;
-        try {
-            String value = headerOrNull(request, ORIGIN_HEADER);
-            if (value != null) {
-                origin = Integer.parseInt(value.trim());
-            }
-        } catch (NumberFormatException e) {
-            origin = 0;
+        int origin = intHeader(request, ORIGIN_HEADER, 0);
+
+        // Only meaningful for INTERCEPT, and deliberately read for every mode anyway: a stray
+        // length or token on some other mode's draft is then visible to the handler's checks
+        // rather than being quietly dropped here.
+        int originalLength = intHeader(request, ORIGINAL_HEADER, -1);
+        String token = headerOrNull(request, TOKEN_HEADER);
+        long position = longHeader(request, POSITION_HEADER, -1);
+
+        if (mode.get() == SendMode.INTERCEPT && originalLength < 0) {
+            // Without it the client's keystream leg cannot be advanced past what the client wrote,
+            // and guessing would desynchronise the session permanently. Not a draft.
+            return Optional.empty();
         }
-        return Optional.of(new DraftMarkers(sessionId.trim(), mode.get(), origin));
+        return Optional.of(new DraftMarkers(sessionId.trim(), mode.get(), origin,
+                Math.max(originalLength, 0), token, position));
+    }
+
+    /** As {@link #intHeader}, for the keystream offset, which outgrows an int on a long session. */
+    private static long longHeader(HttpRequest request, String name, long fallback) {
+        try {
+            String value = headerOrNull(request, name);
+            return value == null ? fallback : Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /** Reads a numeric header, falling back rather than throwing on anything unparseable. */
+    private static int intHeader(HttpRequest request, String name, int fallback) {
+        try {
+            String value = headerOrNull(request, name);
+            return value == null ? fallback : Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     /** Whether a request carries the session marker at all, malformed or not. */
@@ -79,12 +138,30 @@ public record DraftMarkers(String sessionId, SendMode mode, int originPragma) {
         return sessionId != null && !sessionId.isBlank();
     }
 
-    /** Adds these markers to a request, replacing any already present. */
+    /**
+     * Adds these markers to a request, replacing any already present.
+     *
+     * <p>The Mode D pair is added only for Mode D. Putting a token on a Repeater draft would be
+     * inert — that path is trusted by tool origin — but it would also mint a spendable capability
+     * into a tab the user may keep for hours, so it is simply not done.
+     */
     public HttpRequest applyTo(HttpRequest request) {
-        return strip(request)
+        HttpRequest marked = strip(request)
                 .withAddedHeader(SESSION_HEADER, sessionId)
                 .withAddedHeader(SEND_HEADER, mode.wireName())
                 .withAddedHeader(ORIGIN_HEADER, Integer.toString(originPragma));
+
+        if (mode == SendMode.INTERCEPT) {
+            marked = marked.withAddedHeader(ORIGINAL_HEADER, Integer.toString(originalLength));
+            if (token != null) {
+                marked = marked.withAddedHeader(TOKEN_HEADER, token);
+            }
+            if (expectedPosition >= 0) {
+                marked = marked.withAddedHeader(
+                        POSITION_HEADER, Long.toString(expectedPosition));
+            }
+        }
+        return marked;
     }
 
     /**

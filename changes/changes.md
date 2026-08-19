@@ -19,6 +19,659 @@ What changed, in a sentence or two.
 
 ---
 
+## 2026-08-19 — An edited text item sent a caret past the end of its own text
+
+A value edited in the Intercept tab reached the server exactly as typed and the application ignored
+it. The edit was never the problem; the message around it was.
+
+Decoded from the wire (history item 2620, pragma 44), what went out was:
+
+```
+UPDATE handler=113
+    ID_99            = "sevench"     <- the user's new value, 7 characters
+    SELECTION        = (11, 11)
+    CURSOR_POSITION  = 11
+UPDATE handler=113 { FOCUS = false }
+UPDATE handler=96  { FOCUS = true }
+```
+
+**Why:** a Forms client does not send a text item's value on its own. It sends the value together
+with the caret and the selection, and both of those are *indices into that very string*. Shorten the
+text and they still describe the old one, so the message says the text is seven characters long and
+the caret is at eleven. No client can produce that, and the runtime is under no obligation to make
+sense of it.
+
+Confirmed across all three of the session's live edits, each one a different length change, and the
+correlation is exact:
+
+| pragma | client's bytes | sent | new value | old length | SELECTION / CURSOR_POSITION |
+| --- | --- | --- | --- | --- | --- |
+| 31 | 37 | 33 | `thr` (3) | 7 | 7 |
+| 39 | 33 | 36 | `sixchr` (6) | 3 | 3 |
+| 44 | 41 | 37 | `sevench` (7) | 11 | 11 |
+
+**The fix: `codec/TextIndexEdits`.** When an edit changes a string's length, any
+`CURSOR_POSITION` or `SELECTION` in the *same message* that now points past the end of that string
+is pulled back to it, as an additional edit through the same splice and the same identity gate.
+
+Four decisions in it that are not obvious from the diff, and all four are about not overreaching —
+§6.3's guarantee is that everything the user did not edit is untouched *by construction*, and this
+adds to what the user edited rather than weakening that:
+
+- **Only an index that points past the end moves, and only to the end.** A caret the user left in the
+  middle of the string is a position a client could genuinely send. Pragma 39 above is exactly that
+  case — caret 3 into a 6-character value — and nothing is owed there.
+- **An explicit edit outranks the inference.** A caret the user typed themselves is never touched.
+- **Two changed strings in one message adjust nothing.** The caret indexes one of them and nothing
+  here can say which; a stale value the user can see and correct beats a confident wrong one.
+- **The raw surface is left alone entirely.** It is unrestricted by design, the user is writing
+  bytes, and nothing is entitled to add any of its own to them.
+- **Nothing is silent.** The status line names the adjustment the moment the cell is committed, and
+  the send path logs it. Clamping also only ever makes a value smaller, so it cannot overflow the
+  width the property was encoded at.
+
+### The id table is not complete, and the FHT check assumed it was
+
+Found while decoding the same message, and it is a latent "cannot edit this request" for exactly the
+messages people want to edit. The text value of a text-item update is **id 99**, which the 466-entry
+table ported from the reference has no name for. So a perfectly decoded message scores four known
+ids out of five — 0.8, under the 0.9 bar that both the in-flight pre-flight check and the Repeater
+reply check applied.
+
+**Requiring 90% of ids to be named is requiring the table to be complete.** The structural signal
+owes the table nothing, so it now counts as well: `KeyValidation.readsAsFht` accepts a reading that
+either scores ≥ 0.9 on ids, or parses from the first byte to a terminator over at least four
+properties while scoring ≥ 0.5. The second bar sits between the two measured populations rather than
+at the top of one — a wrong key or offset scores 16–24%, the worst correct decode seen on the live
+capture scores 80%. Both call sites now share the one method, so they cannot drift apart again.
+
+**Confirmed the same day.** With the fix loaded, a text item's value was edited from four characters
+to seven in the Intercept tab, forwarded, and **the application acted on the new value** — the first
+time anything in this project has reached the application row of architecture §6.1 and been answered
+properly. The session, **diverged** by the length change (client leg +34, server leg +37), kept
+working for every message after it, which is the live counterpart of `DivergedForwardingTest` and the
+half of §6.2 whose absence was `FRM-93618`. That is **bisection step 5** (§6.11), the hardest of
+steps 3–5, and it closes the open question §6 has carried since 2026-08-14.
+
+The pair also settles the diagnosis by natural experiment: the edit that was ignored left the caret
+past the end of its text, the edit that was obeyed left it inside. **The clamp itself is still not
+confirmed against the target** — the successful edit needed none — so what is proven live is the
+failure mode it removes, not the remedy.
+
+**And the verdict line reads `VERIFIED`**, which is what the relaxed rule predicts for this message
+and what the old one could not have produced: five properties, one id with no name, a parse that runs
+end to end. One loose end stays open and no longer affects anything: an edit made *before* that
+change was converted at all, which the 0.9 bar should have refused. The behaviour it produced is now
+the behaviour the rule specifies, rather than an accident.
+
+**Affects:** `codec/TextIndexEdits.java` (new), `codec/TextIndexEditsTest.java` (new),
+`session/KeyValidation.java`, `burp/proxy/InterceptEditService.java`,
+`burp/repeater/RepeaterSendInterceptor.java`, `burp/ui/FhtDraftPanel.java`,
+`burp/ui/FormsRequestEditor.java`, `session/KeyValidationTest.java`, architecture §6.3 and §6.12,
+`features/features.md`. 266 tests.
+
+---
+
+## 2026-08-19 — Mode D was decoding at the session tail, one whole message too far
+
+An intercepted request could not be edited: the tab refused with *"this message does not decode as
+Oracle Forms data at the keystream offset this session is believed to be at"*. The ledger was opened
+at the session's **tail**, and the tail counted the very message being held.
+
+**Why:** **Burp records a request in the proxy history as soon as it intercepts it, not when it
+forwards it.** So a request sitting in the Intercept tab is already in history, indistinguishable
+from one the server has read, and `SessionTail.measure` — which means "what the server's cipher has
+consumed" — summed it in. The in-flight decode was therefore one whole message further along the
+keystream than the client's cipher, and the FHT check said so. That check is the only reason this
+surfaced as a refusal rather than as another `FRM-93618`.
+
+Confirmed against the live capture rather than reasoned about. In the session that reported it,
+pragma 25 was in proxy history with no response and no annotation — Burp had recorded it but the
+extension had never seen it leave — and an earlier edit's own marker gave the arithmetic away:
+`X-OracleForms-Position: 991` on pragma 19, where the sum of request bodies for pragmas 3–18 is 708
+and pragma 18's body is 283 bytes. 708 + 283 = 991. The ledger was one held message ahead, exactly.
+
+**The error is inherited, which is why one bad measurement cost a whole session.** Forwarding the
+held message advances the ledger over bytes the tail had already counted, so every later position in
+that session carries the same offset. Pragma 19 was 8 bytes — below the 24-byte bar at which a decode
+can be judged at all — so it came back `UNVERIFIABLE`, editing was offered anyway (as designed, since
+refusing every small request would refuse most of the protocol), and the edit went to the server
+encrypted 283 bytes into the wrong part of the keystream. The runtime survived it, but only by luck:
+RC4 preserves length, so the server's cipher stayed aligned for every later message and only pragma
+19's *content* was noise.
+
+**The fix, in three parts.**
+
+1. **`SessionTail.before(source, pragma)`** — the position the session's ciphers stood at
+   *immediately before* a pragma, which is what an in-flight edit needs and is not the tail.
+   `StreamRegistry.openBefore` opens the ledger there. This is exact rather than cautious: the
+   message at that pragma is the one being held, so by construction neither it nor anything after it
+   has reached the server. It also leaves `nextPragma` equal to the message about to go out, where
+   the tail measurement claimed the one after it.
+2. **The ledger is checked against the traffic, and corrected when the traffic wins.** A ledger is an
+   accumulation — one measurement plus every message since — and the only way to check an
+   accumulation is against something measured independently. When the decode does not verify,
+   `InterceptEditService.reconcile` measures the position from captured traffic, decrypts there, and
+   adopts it **only if the result reads as FHT** — `ReplyOffsetRecovery`'s rule applied to the
+   request leg, with no search needed because there are only two candidates and the message in hand
+   decides between them. This is what repairs a session already poisoned by the bug, including one
+   poisoned by a Mode A send while a request was held.
+3. **A disagreement too small to settle is refused, not guessed at.** If the two positions differ and
+   the message is under the judgeable bar, editing is refused with both offsets named, rather than
+   offered at whichever one happened to be in the ledger. That is the exact case that sent pragma 19
+   to the server at a stale offset, and "not modelled is a reason to refuse, not a licence to guess"
+   (§6.11) applies to it as much as to a history gap.
+
+Two smaller things came with it. The history index is now rebuilt when it does not reach the message
+*before* the held one — a precise staleness test, replacing "rebuild on first open", which was
+already right about the hazard and could not see it recur. And `resynchronise` refuses a session that
+has diverged: its counters are the only record of traffic history never saw, so a measurement that
+cannot see that traffic cannot correct it.
+
+**What this does not fix.** Mode A still measures the unbounded tail, so a Repeater append made
+*while* a request is held in the Intercept tab is short by that request — the same root cause, and it
+cannot be fixed the same way because history cannot tell a held request from one that is merely
+awaiting its response. Recorded in architecture §6.9; the intercept path now repairs the ledger
+afterwards, but the Mode A message itself would already have gone.
+
+Also noted while reading the capture, and not fixed: `ProxyHttpRequestResponse.request()` and
+`finalRequest()` are documented identically — both are "the request that was sent by Burp Proxy" —
+so `PragmaHistorySource`'s comment about indexing "the client's bytes" is optimistic. What history
+holds is the request as it left the Proxy stage, which after a Mode D conversion is FHT plaintext.
+Lengths are unaffected for a same-length edit, and a length-changing one diverges the session, which
+is precisely when `reconcile` stands down.
+
+**Affects:** `session/SessionTail.java`, `session/StreamRegistry.java`,
+`burp/proxy/InterceptEditService.java`, `burp/handler/FormsHttpHandler.java`,
+`burp/proxy/InterceptEditServiceTest.java` (new), `session/StreamRegistryTest.java`,
+architecture §6.9 and §6.12, `features/features.md`. 256 tests.
+
+---
+
+## 2026-08-18 — Built Mode D: editing a request in flight from the Intercept tab (6h.0–6h.4)
+
+A Forms request held in Burp's **Intercept** tab can now be decoded, edited — in the property table
+or as raw bytes — and re-encrypted at the session's live keystream position on **Forward**, with the
+client's session carrying on afterwards. 245 tests. **Not yet run against a live target**: 6h.5 is
+bisection steps 3–5, and that is now the whole open question of §6.
+
+As §6.12 predicted, the crypto needed nothing new. `SessionStreams.editInFlight` advances the
+client's leg by what the client wrote and encrypts the edit on the server's, which is §6.2's
+"proxied request `P`, edited to `P′`" row; everything downstream — divergence, persistence,
+`forward()` translation of later messages, the entire response leg — was already built and tested.
+`InterceptEditTest` drives it against a simulated client and server and asserts the gate: after an
+edit of any length the server reads what the user wrote and the client's next message still decodes.
+
+**Three things the build changed, and the first is the sharp one.**
+
+1. **The dispatch order is a safety property, not a preference.** The first working version ran Mode
+   D *after* `RepeaterSendInterceptor`. That interceptor sees the markers, correctly judges that a
+   marker on *proxied* traffic was set by the client, strips them and forwards the body — which is
+   right for every other mode and catastrophic for this one, because a Mode D body is FHT
+   **plaintext**. It would have put decoded traffic, credentials included, on the wire.
+
+   The general rule, which §6.5 does not state because Mode D is the first mode where it bites:
+   **whoever handles a marked request must be the one that owns its body.** The routing decision is
+   now one function with one invariant — an intercept-marked request is never left to another path,
+   every outcome is an encrypt or a drop, there is no fall-through. `InterceptEditRoutingTest` pins
+   it, including the truth table where a bad token, a missing token, a replayed token and an
+   unavailable edit path all still claim the request.
+
+2. **The ledger is measured from fresh history on first open.** A session's history index is cached,
+   and on a live session it goes stale by one message per message the client sends, so a tail
+   measured from a twenty-message-old index puts the ledger twenty messages behind. The FHT check
+   would have caught it, but as a baffling refusal rather than a working edit. Refreshed on the
+   first open only: once the ledger exists the forwarding path advances it and history is not
+   consulted again.
+
+3. **"At most one request in flight" is enforced instead of documented.** §6.12 flagged it as an
+   assumption it could not verify. The decoded-at offset now travels in `X-OracleForms-Position` and
+   is re-checked at Forward; if something else on the session was forwarded while the request was
+   being edited, the ledger has moved past the offset this edit was decoded against and the edit is
+   dropped with that stated. An assumption that costs a comparison to verify should not stay an
+   assumption — and unlike the pre-flight FHT check, which runs before the edit, this covers the
+   window *during* it.
+
+**Trust.** Rule 1 of §6.5 stands unchanged: a Proxy-origin marker is honoured only with a single-use
+128-bit capability the extension minted and never puts on the wire, and `InterceptTokens` makes it
+unforgeable rather than merely improbable. Eviction and `clear()` both fail closed — a refused edit,
+never an accepted one.
+
+**Fail-closed is `drop`,** as chosen. There is no `spoof` on the proxy path, so a refusal cannot be
+explained to the client at all; the log is the only channel and it says so at length. The pre-flight
+check makes it rare: by the time Forward is pressed the key, the ledger and the offset have all been
+checked, and the decode has been shown to read as FHT.
+
+**The offset verifies itself, which no other mode can do.** The tab decrypts at the offset it
+believes and refuses to offer editing if the result does not parse as FHT — moving the wrong-offset
+failure class, the one that produced `FRM-93618`, from something the server discovers to something
+the tab refuses. Its limit is reported rather than hidden: steady-state Forms requests are 8–12 bytes
+and carry no structure to judge, so those are marked `UNVERIFIABLE`, still editable, and labelled.
+
+**Conversion is never automatic.** Returning plaintext from `getRequest()` the moment the tab is
+looked at would rewrite an intercepted request because the user glanced at it — including one they
+meant to forward untouched. Burp calls `setRequestResponse` whenever a tab is shown, so "shown"
+cannot mean "intended"; the user presses a button.
+
+**Prerequisites built with it:** §6.10's **6d.1** (commit a cell on focus loss *and* on every read)
+and **6d.4** (raw plaintext surface, one live surface, commit on switch). 6d.1 was not optional —
+Forward is a different button in a different panel, so focus loss without Enter is what always
+happens, and the old table would have silently discarded the edit and forwarded the original.
+
+**Affects:** `session/SessionStreams.java`, `session/InterceptEditPlan.java` (new),
+`burp/proxy/InterceptTokens.java` and `burp/proxy/InterceptEditService.java` (new),
+`burp/repeater/DraftMarkers.java`, `burp/repeater/SendMode.java`,
+`burp/handler/FormsHttpHandler.java`, `burp/ui/FhtDraftPanel.java`,
+`burp/ui/FormsRequestEditor.java`, `burp/ui/FormsEditorProviders.java`,
+`burp/OracleFormsDecoder.java`; tests `session/InterceptEditTest.java`,
+`burp/proxy/InterceptTokensTest.java`, `burp/handler/InterceptEditRoutingTest.java`,
+`burp/repeater/DraftMarkersTest.java`. Docs: architecture §6.5, §6.6, §6.8, §6.10, §6.12 and the
+status header; `features/features.md`.
+
+---
+
+## 2026-08-18 — Designed §6.12: Mode D, editing a request in flight from the Intercept tab
+
+Designed, not built. The request: intercept a Forms request in Burp's **Intercept** tab, edit it in
+the Oracle Forms tab, press Forward, and have the server act on it and answer normally.
+
+**The finding that shapes it: this is §6.2's own table row, and the only one never exercised.** The
+four-stream ledger's "proxied request `P`, edited to `P′` → `clientRequest` +len(P),
+`serverRequest` +len(P′)" is precisely intercept editing. The ledger was designed for it and then
+built for the Repeater case first, because §6.2 recognised an injection as the same problem with the
+length going 0 → n. So Mode D needs **no new crypto**: divergence, persistence,
+`SessionStreams.forward` translation of every later client message, and the whole response leg
+already exist and are covered by `DivergedForwardingTest`.
+
+That last point answers "the server should give a response back" for free. A request-length edit
+moves only the two request legs, so `serverResponse` and `clientResponse` stay equal and every
+response keeps taking `forward`'s undiverged path — unchanged bytes, both counters advanced, no
+`ReplyOffsetRecovery` involved. A **same-length** edit diverges nothing at all.
+
+Four decisions worth recording, because none is obvious from the section alone:
+
+- **Displaying must not move the ledger.** Decode uses `SessionStreams.cipherAt` — a detached copy —
+  because Burp calls `setRequestResponse` whenever the tab is shown, including for messages the user
+  never edits and messages they go on to drop. Only Forward commits.
+- **The offset verifies itself, which Mode A never could.** We decrypt at the offset we believe, and
+  if it is right the plaintext parses as FHT with known property ids — `KeyValidation.signalsOf`
+  already scores exactly this. So the tab offers editing *only* when the decode reads as FHT. That
+  moves the entire wrong-offset failure class, the one that produced `FRM-93618`, from something the
+  server discovers to something the tab refuses before the user types.
+- **A capability token, not a relaxed trust rule.** Mode D needs a marked request arriving *from the
+  Proxy*, which is what §6.5 rule 1 forbids — a marker on proxied traffic was set by the client. The
+  rule stands: a Proxy-origin marker is honoured only with a single-use `X-OracleForms-Token` this
+  extension minted and never put on the wire. Rejected `messageId()` correlation as the primary
+  mechanism, because the API documents those ids only as unique per request/response pair and does
+  not promise `InterceptedRequest` and `HttpRequestToBeSent` share a number.
+- **Failing closed means `drop`,** chosen by the user over forwarding the original bytes.
+  `ProxyRequestToBeSentAction` has no `spoof`, so a refusal cannot be explained to the client at all;
+  sending nothing is the only answer that never lets a wrong outcome look like a right one. Its price
+  is recorded plainly in §6.9 — a dropped edit will probably end the session — and the pre-flight
+  check above exists to make it rare rather than to soften it.
+
+**Prerequisites, not optional:** §6.10's **6d.1** (commit a cell on focus loss and on read) and
+**6d.4** (raw plaintext surface and the one-live-surface toggle). 6d.1 especially — **Forward** is a
+different button in a different panel, so focus loss without pressing Enter is guaranteed rather than
+likely, and today's table would silently discard the edit. The raw surface was chosen over the
+property table alone because interception is exactly where the bytes the codec cannot yet name are
+the interesting ones.
+
+**Why build this next.** Bisection steps 3–5 (§6.11) are the whole remaining open question of §6, and
+Mode D is a cleaner instrument for them than Mode A: in-sequence, no tail measurement, no invented
+pragma, no refreshed cookie, no race with a live client. If an edit fails through Mode D, it is the
+edit.
+
+**Two UI assumptions are unverified and carry the feature** (§6.12): that Burp shows
+extension-provided editors in the Intercept tab at all, and that `EditorCreationContext` reports
+`DEFAULT` plus a Proxy `toolSource()` there. `toolSource()` is confirmed to exist on the interface;
+what it returns in that tab is not. Both are cheap to settle by loading the extension, and 6h.3 is
+guesswork until they are.
+
+Also corrected two stale claims in the document's own status header while editing it: the test count
+(197 → 214) and "step 2 is still unrun", which §6.11 has recorded as run and passed since earlier the
+same day.
+
+**Affects:** `architecture/architecture.md` §6.4 (now four modes), §6.5 (marker list and rule 1),
+§6.6 (planned components), §6.8 (step 6h), §6.9 (limits), **§6.12 (new)**, and the status header;
+`features/features.md`. No code yet.
+
+---
+
+## 2026-08-18 — Showing a reply and trusting it are now separate decisions
+
+The diagnostic added earlier today paid for itself on the first run. The refusal reported its nearest
+miss, and the miss was **4 of 4 property ids known, 31 bytes consumed, no terminator reached** — a
+candidate 61,196 bytes past the ledger. So the reply-offset search was finding the answer and
+throwing it away, while the pane went on showing the ledger's reading of **2 of 9**.
+
+That is a contradiction, not a conservative choice: `RepeaterSendInterceptor.readsAsFht` — the same
+class's own test for "this reply decoded correctly" — passes at ≥ 0.9 known ids without asking for a
+complete parse. It rejected the 2/9 reading, which is what triggered the search, and it would have
+accepted the 4/4 one. The system was simultaneously calling a reading too weak to display and strong
+enough to condemn the alternative.
+
+**Split the two decisions.** Accepting an offset did two things at once — choose what to display, and
+move the session's response ledger — and only the second is dangerous, because a wrong ledger sits
+under the next send and puts bytes on a live application's wire. So:
+
+- **Resynchronising the ledger** keeps the strict gate exactly as it was: every id known, the parse
+  reaching a terminator, no tie, forward only. Nothing about that has been loosened.
+- **Displaying** now uses `readsAsFht`, the bar this class already applies to the same question, so
+  the two can no longer disagree. The decode is labelled `UNVERIFIED` in its header with the offset
+  and the gap, and the log says plainly that the ledger was not moved and the next reply will be off
+  by the same amount.
+
+**Why not just loosen the gate:** completeness is what closed the false-positive hole the original
+work found, where noise produced a "clean" offset 133,417 bytes away across a quarter-million
+candidates. It earns its place for a decision that later reaches the wire. It does not earn its place
+for deciding whether the user is allowed to read their own reply.
+
+**Confirmed against the live capture.** The extension logged request offset 1197 and response offset
+280,323; tabulating that session from proxy history reproduces both exactly. Pragma 40 — the client's
+outstanding long-poll — is in history with `<no response>`, which is the §6.11 asymmetry visible
+directly rather than inferred: the request leg is right, the response leg is short by exactly the
+response that never came back.
+
+**Affects:** `burp/DecodedBodyCache.java` (a `put` overload carrying a caveat),
+`burp/DecodeService.java`, `burp/repeater/RepeaterSendInterceptor.java`,
+`session/ReplyOffsetRecoveryTest.java`. 214 tests.
+
+---
+
+## 2026-08-18 — The reply-offset recovery could never be seen, whatever it found
+
+A second live Mode A send reported "the same error": the response pane again showed a reply decoded
+at the wrong keystream offset. Reading the proxy history for that session and then the display path
+found that **the recovery built earlier the same day cannot reach the screen**, so it makes no
+observable difference whether its search succeeds.
+
+Three defects, in the order they bite:
+
+1. **The rendered result is cached forever, and the correction is not.** `DecodeService.decode`
+   caches rendered text under `(session, direction, pragma)` in a map that never expires within a
+   project. The reply is rendered once from the ledger's offset, and the recovery — landing seconds
+   later on the decode executor — writes only the *plaintext* cache. Reopening the message re-serves
+   the stale rendering, so the corrected reading was unreachable through the UI permanently, not
+   merely until a repaint.
+2. **Nothing asks an open editor to paint again.** `FormsEditorPane.show` runs once per
+   `setRequestResponse`. The search takes seconds and the user is looking at the pane the whole
+   time.
+3. **A write-ordering race.** `interceptResponse` cached the ledger's reading *after* `decryptReply`
+   had already scheduled the recovery. Both write the same entry, so a fast search could publish the
+   good plaintext and have it immediately overwritten by the unreadable one — permanently, since
+   nothing runs a second time.
+
+Fixed by making a superseding `put` invalidate the rendering it produced and notify open editors
+(`DecodeService.DecodeUpdateListener`, held in a weak set so Burp discarding an editor needs no
+deregistration it never announces), by having `FormsEditorPane` repaint on a matching update, and by
+returning the recovery as a `Runnable` the caller runs *after* publishing the ledger's attempt.
+
+Also: a refusal now reports its nearest miss. `ReplyOffsetRecovery.scan` returns the most FHT-like
+offset it saw alongside the one it was willing to believe, and the log line quotes it.
+
+**Why:** an empty `Optional` cannot distinguish "no offset in this window decrypts the body" from
+"the right offset was rejected over one unknown property id", and those need opposite fixes — a
+wider window versus a looser gate. Note the two thresholds currently disagree: `readsAsFht` treats
+≥ 0.9 known ids as a good decode, while `ReplyOffsetRecovery.convincing` demands 1.0 *and* a parse
+reaching the terminator. A reply carrying one id outside the 467-entry table is therefore
+undiscoverable by a search that would have accepted it as correct had the ledger produced it. That
+is left as-is pending a log line from a real run, because loosening it trades a false refusal for a
+false answer, and this send path is deliberately built to prefer the former.
+
+**Measured from the live capture** (session tabulated from proxy history, lengths taken from
+`Content-Length` so the MCP's lossy body rendering does not matter): history was complete and
+contiguous over pragmas 1 and 3–29 with no gaps, so Mode A was right not to refuse. At the send, the
+request leg stood at 594 bytes and the response leg at 277,340 — the asymmetry being one 218,892-byte
+logical response split across pragmas 6–9 by the `NULLPOST` rule (66,000 x3 + 20,892), which
+confirms the architecture §1 fragmentation rule against a second session. No response carried
+`Content-Encoding` or chunking, so the stored body lengths equal the wire lengths and the tail
+arithmetic's inputs are sound. Worth noting against `DEFAULT_WINDOW`: at 256 KB the search window is
+smaller than this session's own response offset, and only 17% larger than that single fragmented
+response — one flush of that size and the answer is outside the window.
+
+**Affects:** `burp/DecodeService.java`, `burp/ui/FormsEditorPane.java`,
+`burp/repeater/RepeaterSendInterceptor.java`, `session/ReplyOffsetRecovery.java`,
+`burp/SupersededDecodeTest.java` (new), `session/ReplyOffsetRecoveryTest.java`. 213 tests.
+
+---
+
+## 2026-08-18 — Bisection step 2 run: the request was accepted, and the reply leg was short
+
+**The decisive experiment finally ran, and an appended message was accepted by a live Forms
+runtime.** An unedited Mode A draft drew a normal encrypted response rather than `FRM-93618`. That
+retires every cryptographic and transport hypothesis for the request direction: the tail measurement,
+the keystream offset, the `Pragma` rewrite and the cookie refresh are all correct against a real
+server. It is the first time anything from this project has been *acted on* by the target.
+
+The reply, however, decoded to noise — five properties, none of their ids in the 467-entry table, and
+a string length demanding 37,038 bytes from a 102-byte body. By the §8 oracle (a correct offset
+scores ~100% known ids, a wrong one 16–24%) that is a clean decrypt of the wrong keystream position.
+
+**Why the response tail is short, and why it is not a race.** Proxy history is asymmetric about
+traffic in flight. A Forms client **long-polls** — the capture shows requests held open for 28
+seconds — so at almost any moment Burp has recorded a request whose response has not come back.
+`SessionTail` therefore measures the request leg correctly and the response leg short by exactly that
+outstanding response's length. Sending is unaffected, because the server's *request* cipher really is
+where we think it is. The reply is affected, because answering an injected message is what makes the
+runtime flush its pending output down the waiting poll: the server emits that response first,
+advancing its response cipher, and only then answers us.
+
+**The length of a response that has not arrived cannot be known at send time.** That is structural.
+
+**So it is solved rather than guessed.** `ReplyOffsetRecovery` searches forward from the ledger's
+position for the offset at which the body parses, and the result is *verified* before it is believed
+— every property id must be in the table and the parse must reach the terminator. That is the same
+oracle §8 uses on a candidate key, and it is what distinguishes this from the guessed offset §6.11
+forbids: a guess is an answer nothing can check. The gap it reports is the missing response's length,
+so the ledger is resynchronised and the error does not carry into the next send.
+
+**Three things the search does deliberately:**
+
+- **Forward only.** The ledger can be behind the server but never ahead of it, because nothing
+  removes bytes from a keystream. A backward search would be hunting for something that cannot be
+  there, and every offset examined is another chance at a false positive.
+- **Refuses on a tie, and on anything short.** Two equally clean offsets is a coincidence with a
+  second opinion, not an answer. A 2-byte acknowledgement carries no evidence at all.
+- **Demands a complete parse.** At three properties with all ids known, a body of pure noise found a
+  "clean" offset 133,417 bytes away during development — a quarter of a million candidates is enough
+  chances that merely-unlikely is not good enough. Requiring the parse to reach the terminator means
+  every length and type marker in the body agreed with each other, which no wrong offset managed
+  across eight randomised full-window trials.
+
+It runs on `DecodeService`'s existing executor rather than the Burp response thread that delivered
+the reply — the full window is a couple of seconds of work (criterion 5) — and the ledger's own
+attempt is cached first, so the response pane always shows something and the recovery overwrites it.
+
+**What is now known and not known.** The request direction is confirmed correct against the live
+target. The response direction is correct once recovered, and the recovery is verified rather than
+assumed. **Still unrun: bisection steps 3–5**, which are the ones that test whether an *edit*
+survives — integer, same-length string, then length-changing string.
+
+**Affects:** new `ReplyOffsetRecovery` and its tests, `KeyValidation.signalsOf` (extracted and made
+public), `RepeaterSendInterceptor` (reply verification and recovery, new executor parameter),
+`DecodeService.background()`, `OracleFormsDecoder`; architecture §6.11 and `features/features.md`.
+
+---
+
+## 2026-08-18 — The proxy never re-encrypted forwarded traffic, so an injection killed the session
+
+`FormsHttpHandler` now carries each proxied message of a **diverged** session across the two cipher
+relationships — decrypting it on the leg facing whoever sent it and re-encrypting it on the leg
+facing whoever receives it — instead of forwarding the bytes unchanged. This is the cause of
+`FRM-93618`, and it is a defect in the implementation rather than in the design.
+
+**Why:** architecture §6.2 says Burp is a man in the middle with *two* cipher relationships, and that
+after an injection the client-facing and server-facing legs sit at different keystream positions. The
+ledger tracked that faithfully — four counters, correctly advanced — but **nothing ever applied it to
+any bytes.** `CLIENT_REQUEST` and `CLIENT_RESPONSE` were never once used to transform a message in
+`src/main/`; they only appeared in counter arithmetic. So a Mode A send left the server's request
+cipher `n` bytes ahead of the client's, and the client's very next poll was forwarded verbatim: the
+client encrypted at *T*, the server decrypted at *T + n*, and the Forms runtime was handed noise.
+`FRM-93618` is the servlet reporting exactly that — it could not read a coherent message from
+`frmweb`. Because that error is fatal, the runtime dies and every later send into the session,
+including a perfectly encrypted one, answers the same way.
+
+**Why the tests did not catch it.** `RepeaterInjectionEndToEndTest` step 6 and every helper in
+`SessionStreamsTest` do the translation themselves — `apply(CLIENT_REQUEST)` then
+`apply(SERVER_REQUEST)` — and then assert the server can read the result. They were testing the
+model, and the model is right. Production called `observeUnmodified`, which advances both counters
+and returns nothing, and no test ever drove *that* path with a party on the other end. A four-column
+ledger is not a four-stream proxy, and the suite could not tell the difference.
+`DivergedForwardingTest` now drives the production call and keeps an independent client and server
+either side of it; its first test pins the old behaviour down as the failure.
+
+**Three decisions in it that are not obvious from the diff:**
+
+- **Undiverged sessions are not translated.** The two legs share a keystream position, so a
+  round trip through both ciphers returns the input after two RC4 passes. `SessionStreams.forward`
+  reports whether it rewrote anything, and the handler rebuilds the message only when it did — so a
+  session nobody has ever sent into still costs one map lookup on the hot path, as §5 requires.
+- **`StreamRegistry.forProxiedMessage` exists rather than reusing `peek`.** The live map is an LRU
+  and it is empty after an extension reload, so it is not a trustworthy record of which sessions have
+  diverged. Either would silently drop a session back to forwarding client-side ciphertext at a
+  server that has moved on — the exact failure being fixed. The persisted counters are the durable
+  record; the answer is cached both ways so the project file is read once per session, not once per
+  message.
+- **A translated message checkpoints immediately.** The counters moved, the divergence is still
+  there, and a reload before the next message would otherwise resume from a position the session has
+  left. Only diverged sessions reach it, which is what stops this becoming a project-file write per
+  proxied message.
+
+**One consequence, handled:** `PragmaHistorySource` now indexes `request()` rather than
+`finalRequest()`. Proxy history is the *client's* view of the session — one continuous cipher from
+pragma 3 — and that is what replay reconstructs by summing lengths. After a divergence
+`finalRequest()` holds bytes from the server-facing stream, which replay does not follow, so every
+message after an injection would have decoded to noise in the editor. Lengths are identical either
+way, so the tail measurement is untouched.
+
+**What this does not settle.** It explains a session that dies after the first injection and answers
+`FRM-93618` for every send thereafter. It does **not** prove the first send was correct, and fixing
+it is not evidence it was the only cause — the same trap §6.11 records for the desync fix. The
+bisection in §6.11 is still unrun and its step 2 — an *unedited* draft on a fresh idle session — is
+still the decisive experiment.
+
+**Affects:** `SessionStreams` (new `forward`/`Forwarded`, `diverged(Direction)`), `StreamRegistry`
+(new `forProxiedMessage`, divergence cache), `FormsHttpHandler` (rewrites forwarded bodies),
+`PragmaHistorySource`, new `DivergedForwardingTest`; architecture §6.2, §6.8, §6.9, §6.11 and
+`features/features.md`.
+
+---
+
+## 2026-08-14 — Refuse instead of guessing after an untracked send (the ledger desync)
+
+`FormsHttpHandler` now marks a session's keystream position **unrecoverable** when Forms ciphertext
+leaves Burp from one of its own tools without the draft markers, and Mode A refuses to send for that
+session, durably and with the reason. This is the fix proposed in architecture §6.11 and it is the
+first code change since the live-target rejection.
+
+**Why:** the entry below records the diagnosis. The short form is that a plain Repeater resend of
+captured ciphertext reaches the server and advances its request cipher, but `api.proxy().history()`
+is proxy-only, so nothing later can see those bytes and every tail measurement is short by their
+length — permanently, silently, and with the failure surfacing as a dead application session rather
+than as a message. §6.9 had called that offset "not modelled"; in practice not-modelled meant
+*guessed*, which is the one thing the rest of this design never does. Worth fixing whether or not it
+caused FRM-93618, which the bisection has yet to say.
+
+**The shape of it.** The refusal rides the type system so no call site can forget it:
+`StreamPositionUnknownException` is a new abstract parent over the existing `StreamGapException` and
+a new `StreamDesyncException`, and `StreamRegistry.open` declares the parent. Widening it that way
+made the compiler find every caller that previously handled only a gap. The subclasses differ in
+`isRecoverable()`, which is the honest distinction: a gap might be closed by capturing the missing
+pragma, a desync never can be, because the bytes the server consumed are gone.
+
+**Five decisions worth recording, because none is visible in the diff:**
+
+- The desync is checked **before** the live ledger, not after — an already-open ledger is exactly as
+  wrong as a freshly measured one once untracked bytes have landed, and more dangerous because it
+  looks authoritative. Marking also drops any open ledger.
+- **Responses and `NULLPOST`s do not spend a session.** Only a request moves the server's request
+  cipher, and a `NULLPOST` is never encrypted at all, so resending one costs nothing.
+- **Drafts never reach the check**, because `RepeaterSendInterceptor` runs first and returns. That is
+  precisely the distinction being drawn: a draft is encrypted at send time and accounted for.
+- **Only the first mark per session writes to the project file**, so an Intruder run over a spent
+  session logs once rather than once per payload.
+- **An unreadable marker is not treated as absent**, unlike every other read in `PersistedKeyStore`.
+  A record that exists but will not parse still proves something was marked, and "I know this session
+  was broken but not why" should keep refusing. Elsewhere a corrupt entry costs a rebuild; here it
+  would cost a live application session.
+
+**What it deliberately does not do:** adjust the offset by the bytes it saw leave. The correct offset
+is *not knowable* rather than merely unrecorded — traffic can reach the server from another Burp
+instance, from curl, or from the application with the proxy bypassed — so adjusting by the observed
+part would turn a detectable failure into an undetectable one.
+
+**A false positive is possible and is the right way round.** The mark is set as the request leaves
+Burp, not when the server acknowledges it, so ciphertext sent to a refused connection still spends the
+session. A wrong refusal costs an application restart; a wrong permission costs a corrupted live
+session that gives no sign of itself.
+
+**Affects:** `session/StreamPositionUnknownException.java` (new), `session/StreamDesyncException.java`
+(new), `session/StreamGapException.java`, `session/StreamPositionStore.java`,
+`session/StreamRegistry.java`, `burp/handler/FormsHttpHandler.java`,
+`burp/repeater/RepeaterSendInterceptor.java`, `burp/persistence/PersistedKeyStore.java` (a third
+sibling collection, `desync`, for the same reason `streams` is one), and
+`architecture/architecture.md` §3, §6.6, §6.9, §6.11. Tests: `StreamDesyncTest` (new, 8),
+`StreamRegistryTest` and `KeyChangeInvalidatesStreamsTest` updated for the widened store contract.
+**193 tests, 0 failures**, up from 185.
+
+**Not yet done:** the desync is not surfaced in the Sessions tab, so a user learns of it at Send time
+from the refusal response. That is where they are looking, but a column would be better.
+
+## 2026-08-14 — First live-target send: rejected with FRM-93618
+
+An edited message was sent to the real Forms server in Mode A. The server answered
+`ifError:0/FRM-93618: fatal error reading data from runtime process`. Documented as architecture
+§6.11, with the ranked suspects and a five-step bisection; §6.9 gained two limits; `features.md` and
+`CLAUDE.md` no longer claim nothing has been sent to a live target.
+
+**No code changed.** This entry records a finding, not a fix — the decisive experiment (§6.11
+step 2: send an *unedited* draft) has not been run, and changing the send path before it would be
+guessing at which of three suspects is real.
+
+**Why it matters more than one failed send.** FRM-93618 is the servlet failing to read from the
+`frmweb` runtime process, which is what being fed unparseable bytes looks like — not what a
+well-formed but stale message looks like. So it indicts the *cryptographic* layer of §6.1, the one
+layer the design claims to own completely, rather than the application layer it has always been
+honest about not owning.
+
+**The suspect worth acting on regardless of the outcome.** `FormsHttpHandler.trackForwarded` ignores
+any Forms message not from the Proxy. A non-draft Repeater tab holding captured ciphertext is a valid
+Forms message: it reaches the server and advances the server's request cipher, but proxy history
+never records it, so every later tail measurement for that session is short by its length —
+permanently, and silently. §6.9 had already noted this offset was "not modelled"; what that turned
+out to mean in practice was *guessed*, which is the one thing the rest of the design never does. The
+proposed fix is to poison the ledger and refuse, the same treatment a gap in history already gets.
+
+**What was ruled out, and how.** A length-changing edit cannot leave a stale length field behind:
+FHT is terminator-delimited and self-describing, with no packet- or message-level byte count anywhere
+in `FhtParser`. Worth recording because it is the first thing anyone will suspect of a splicing
+writer.
+
+**A caveat about the identity gate, stated because it is easy to over-read.** It proves that
+re-encoding an *unchanged* value reproduces the original bytes. It says nothing about whether a
+*changed* one is well-formed. That is the right scope — it is a check on the encoder, not on the
+protocol — but a passing gate is not evidence that an edited message will be accepted.
+
+**Affects:** `architecture/architecture.md` (§6.9, §6.11), `features/features.md`, `CLAUDE.md`.
+
+## 2026-08-14 — Designed §6.10: making the Repeater tab editable in practice
+
+Raised from use: a message sent to Repeater could not be manipulated. Diagnosed as four independent
+causes and designed as architecture §6.10, build order 6d.1–6d.5. **Design only; nothing built.**
+
+**Why 6d was marked done and still did not work.** The property table exists and functions. But it
+is reachable only via the extension's own context items — `Ctrl+R` produces a ciphertext tab with no
+route to an editable one; a typed cell is discarded unless Enter is pressed, because the `JTable`
+never sets `terminateEditOnFocusLost`; the table covers only values `FhtWriter` can round-trip; and
+`FormsRequestEditor.getRequest` fails *open*, sending the unedited body when a splice throws.
+
+Each of those alone is enough to make the feature look absent, which is why "6d: done" was true of
+the code and false of the experience. The gate for 6d was "edit a property, see the plaintext change"
+— a gate written against the mechanism rather than against a user reaching it.
+
+**Affects:** `architecture/architecture.md` (§6.8 table, §6.10).
+
 ## 2026-08-14 — Redacted the rotating cookie suffix, missed by the first pass
 
 The 2026-08-13 redaction replaced every hostname, `JSESSIONID`, server instance name and WebLogic

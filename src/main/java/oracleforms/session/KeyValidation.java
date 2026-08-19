@@ -71,6 +71,49 @@ public final class KeyValidation {
      */
     public static final double MIN_KNOWN_FRACTION = 0.9;
 
+    /**
+     * The share of property ids that must be real once the byte structure has vouched for the
+     * reading as well.
+     *
+     * <p>Sits between the two measured populations rather than at the top of one: a wrong key or a
+     * wrong offset scores 16–24%, and the worst correct decode seen on the live capture scores 80%
+     * — a five-property text-item update with one id the table has no name for.
+     */
+    public static final double MIN_KNOWN_FRACTION_WHEN_COMPLETE = 0.5;
+
+    /**
+     * Whether a decoded body reads as FHT rather than as noise.
+     *
+     * <p>Shared by every caller asking that question — the in-flight edit's pre-flight check and the
+     * reply check on a Repeater send — because having them disagree once already produced a system
+     * that called a reading too weak to display and strong enough to condemn the alternative.
+     *
+     * <h2>Two independent signals, because the id table is not complete</h2>
+     *
+     * <p>Requiring 90% of ids to be named is, in effect, requiring the table to be complete, and the
+     * capture proves it is not: an ordinary text-item update from the live target carries the item's
+     * own value under id 99, which has no name here, alongside {@code SELECTION},
+     * {@code CURSOR_POSITION} and two {@code FOCUS} properties. Four names out of five is 0.8 — a
+     * perfectly decoded message, refused for a gap in a table ported from someone else's research.
+     *
+     * <p>So the structural signal counts as well, and it owes the table nothing: a parse that runs
+     * from the first byte to a terminator, over enough properties to mean something, is evidence
+     * about the <em>bytes</em>. Noise rarely produces one, and when it does it produces almost no
+     * recognisable ids with it — which is why the two are required together rather than either
+     * alone.
+     */
+    public static boolean readsAsFht(Signals signals) {
+        if (signals == null) {
+            return false;
+        }
+        if (signals.knownFraction() >= MIN_KNOWN_FRACTION) {
+            return true;
+        }
+        return signals.complete()
+                && signals.properties() >= MIN_PROPERTIES
+                && signals.knownFraction() >= MIN_KNOWN_FRACTION_WHEN_COMPLETE;
+    }
+
     /** What a parse of one candidate decryption looked like. */
     public record Signals(
             boolean complete, int bytesConsumed, int messages, int properties, int knownProperties) {
@@ -235,7 +278,18 @@ public final class KeyValidation {
     private static Signals parseWith(byte[] key, byte[] body) {
         byte[] plaintext = body.clone();
         new Rc4Stream(key).apply(plaintext);
+        return signalsOf(plaintext);
+    }
 
+    /**
+     * How well a candidate plaintext parses as FHT.
+     *
+     * <p>The same oracle {@link #validate} uses on a key, exposed for callers that already hold a
+     * decrypted body and are asking a different question about it — most usefully "was this decrypted
+     * at the right keystream offset?", which has exactly the same answer shape. A correct offset
+     * yields property ids drawn from the 470-entry table; a wrong one lands on them only by luck.
+     */
+    public static Signals signalsOf(byte[] plaintext) {
         FhtPacket packet = new FhtParser().parse(plaintext, new StringDictionary());
 
         int properties = 0;

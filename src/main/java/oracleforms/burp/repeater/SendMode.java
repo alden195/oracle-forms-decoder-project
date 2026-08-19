@@ -25,7 +25,17 @@ public enum SendMode {
      * <p>For comparing ciphertext and for checking the re-encoder against a capture. Valid to send
      * only in the degenerate case where the target pragma is already the session's last.
      */
-    OFFSET("offset");
+    OFFSET("offset"),
+
+    /**
+     * Mode D: re-encrypt a request the proxy is holding, at the session's live position.
+     *
+     * <p>The one mode nobody chooses, because it cannot be ambiguous — a request sitting in the
+     * Intercept tab admits exactly one sensible keystream position, the one its own session is
+     * already at. It invents nothing: the {@code Pragma} number and the cookies are the client's own
+     * and stay untouched (architecture &sect;6.12).
+     */
+    INTERCEPT("intercept");
 
     private final String wireName;
 
@@ -53,6 +63,17 @@ public enum SendMode {
 
     /** Whether sending in this mode acts on a live application session. */
     public boolean touchesLiveSession() {
-        return this == TAIL;
+        return this == TAIL || this == INTERCEPT;
+    }
+
+    /**
+     * Whether this mode rewrites a message the client sent rather than sending one of our own.
+     *
+     * <p>The distinction the handler branches on: an in-flight edit advances the client's leg past
+     * what the client actually wrote, which no other mode does, and keeps the client's own sequence
+     * number and cookies, which every other mode replaces.
+     */
+    public boolean isInFlightEdit() {
+        return this == INTERCEPT;
     }
 }

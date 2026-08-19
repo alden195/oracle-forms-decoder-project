@@ -92,8 +92,18 @@ public final class PragmaHistorySource implements PragmaSource {
                 }
             }
 
+            // The *client's* bytes, not the ones forwarded to the server, and the difference only
+            // appears once a session has diverged. From pragma 3 the client runs one continuous
+            // request cipher, so replaying it means summing the lengths the client produced and
+            // decrypting what the client wrote — which is precisely `request()`. After a Repeater
+            // injection the handler re-encrypts each forwarded message at the server's position
+            // (architecture §6.2), so `finalRequest()` would be ciphertext from a stream this replay
+            // does not follow, and every message after the injection would decode to noise.
+            //
+            // Lengths are identical either way — RC4 preserves them and nothing here resizes a
+            // proxied body — so the tail measurement is unaffected by the choice.
             index.get(Direction.REQUEST)
-                    .putIfAbsent(pragma, item.finalRequest().body().getBytes());
+                    .putIfAbsent(pragma, clientRequestBody(item));
 
             if (item.response() != null) {
                 index.get(Direction.RESPONSE)
@@ -154,6 +164,24 @@ public final class PragmaHistorySource implements PragmaSource {
      */
     public Optional<String> latestCookieHeader() {
         return Optional.ofNullable(latestCookieHeader);
+    }
+
+    /**
+     * The request body as the client wrote it, falling back to the forwarded one.
+     *
+     * <p>The fallback matters for a history item Burp did not record an unmodified copy of. Falling
+     * back is right rather than skipping: for every session that has never been injected into the two
+     * are the same bytes, and that is almost all of them.
+     */
+    private static byte[] clientRequestBody(ProxyHttpRequestResponse item) {
+        try {
+            if (item.request() != null) {
+                return item.request().body().getBytes();
+            }
+        } catch (RuntimeException e) {
+            // Fall through to the forwarded request.
+        }
+        return item.finalRequest().body().getBytes();
     }
 
     private static String cookieHeaderOf(burp.api.montoya.http.message.requests.HttpRequest request) {
